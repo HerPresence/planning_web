@@ -37,6 +37,16 @@ def ensure_import_sources_table(cur):
         """
     )
 
+    cur.execute("ALTER TABLE import_sources ADD COLUMN IF NOT EXISTS source_type TEXT;")
+    cur.execute("ALTER TABLE import_sources ADD COLUMN IF NOT EXISTS source_url TEXT;")
+    cur.execute("ALTER TABLE import_sources ADD COLUMN IF NOT EXISTS article_id_field TEXT;")
+    cur.execute("ALTER TABLE import_sources ADD COLUMN IF NOT EXISTS article_name_field TEXT;")
+    cur.execute("ALTER TABLE import_sources ADD COLUMN IF NOT EXISTS article_type_field TEXT;")
+    cur.execute("ALTER TABLE import_sources ADD COLUMN IF NOT EXISTS level1_field TEXT;")
+    cur.execute("ALTER TABLE import_sources ADD COLUMN IF NOT EXISTS level2_field TEXT;")
+    cur.execute("ALTER TABLE import_sources ADD COLUMN IF NOT EXISTS pnl_id_field TEXT;")
+    cur.execute("ALTER TABLE import_sources ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;")
+
 
 @router.get("")
 def get_import_sources():
