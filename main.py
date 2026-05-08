@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse
 from routers.articles import router as articles_router
 from routers.article_mapping import router as mapping_router
 from routers.article_import import router as import_router
+from routers.departments import router as departments_router
 
 app = FastAPI(title="Planning Web")
 
@@ -30,6 +31,7 @@ app.add_middleware(
 app.include_router(articles_router)
 app.include_router(mapping_router)
 app.include_router(import_router)
+app.include_router(departments_router)
 
 
 # REACT STATIC FILES
