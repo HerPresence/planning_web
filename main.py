@@ -7,6 +7,7 @@ from routers.articles import router as articles_router
 from routers.article_mapping import router as mapping_router
 from routers.article_import import router as import_router
 from routers.departments import router as departments_router
+from routers.pnl_data import router as pnl_data_router
 
 app = FastAPI(title="Planning Web")
 
@@ -32,6 +33,7 @@ app.include_router(articles_router)
 app.include_router(mapping_router)
 app.include_router(import_router)
 app.include_router(departments_router)
+app.include_router(pnl_data_router)
 
 
 # REACT STATIC FILES
