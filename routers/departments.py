@@ -11,7 +11,7 @@ def ensure_department_table():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS dim_department (
-            department_id TEXT PRIMARY KEY,
+            department_id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
             holding_name TEXT,
             organization_name TEXT,
             region_name TEXT,
@@ -22,23 +22,9 @@ def ensure_department_table():
         """
     )
 
-    cur.execute(
-        "ALTER TABLE dim_department ADD COLUMN IF NOT EXISTS holding_name TEXT"
-    )
-    cur.execute(
-        "ALTER TABLE dim_department ADD COLUMN IF NOT EXISTS organization_name TEXT"
-    )
-    cur.execute("ALTER TABLE dim_department ADD COLUMN IF NOT EXISTS region_name TEXT")
-    cur.execute("ALTER TABLE dim_department ADD COLUMN IF NOT EXISTS branch_name TEXT")
-    cur.execute("ALTER TABLE dim_department ADD COLUMN IF NOT EXISTS department_name TEXT")
-    cur.execute("ALTER TABLE dim_department ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true")
-
     conn.commit()
     cur.close()
     conn.close()
-
-
-ensure_department_table()
 
 
 @router.get("")
@@ -77,7 +63,6 @@ def get_departments():
 
 @router.post("")
 def create_department(
-    department_id: str = Form(...),
     holding_name: str = Form(""),
     organization_name: str = Form(""),
     region_name: str = Form(""),
@@ -90,23 +75,35 @@ def create_department(
     cur.execute(
         """
         INSERT INTO dim_department
-        (department_id, holding_name, organization_name, region_name, branch_name, department_name, is_active)
-        VALUES (%s, %s, %s, %s, %s, %s, true)
+        (holding_name, organization_name, region_name, branch_name, department_name, is_active)
+        VALUES (%s, %s, %s, %s, %s, true)
+        RETURNING department_id
         """,
-        (department_id, holding_name, organization_name, region_name, branch_name, department_name),
+        (holding_name, organization_name, region_name, branch_name, department_name),
     )
+    new_id = cur.fetchone()[0]
 
     conn.commit()
     cur.close()
     conn.close()
 
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "department": {
+            "department_id": new_id,
+            "holding_name": holding_name,
+            "organization_name": organization_name,
+            "region_name": region_name,
+            "branch_name": branch_name,
+            "department_name": department_name,
+            "is_active": True,
+        },
+    }
 
 
 @router.put("/{old_department_id}")
 def update_department(
-    old_department_id: str,
-    department_id: str = Form(...),
+    old_department_id: int,
     holding_name: str = Form(""),
     organization_name: str = Form(""),
     region_name: str = Form(""),
@@ -120,8 +117,7 @@ def update_department(
     cur.execute(
         """
         UPDATE dim_department
-        SET department_id = %s,
-            holding_name = %s,
+        SET holding_name = %s,
             organization_name = %s,
             region_name = %s,
             branch_name = %s,
@@ -130,7 +126,6 @@ def update_department(
         WHERE department_id = %s
         """,
         (
-            department_id,
             holding_name,
             organization_name,
             region_name,

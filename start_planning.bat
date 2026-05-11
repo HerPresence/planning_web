@@ -33,7 +33,22 @@ echo Starting PostgreSQL...
 if errorlevel 1 (
     echo PostgreSQL may already be running. Continue...
 )
-timeout /t 3 >nul
+
+echo Waiting for PostgreSQL on port 5432...
+set "PG_WAIT=0"
+:wait_pg
+netstat -ano | findstr /C:":5432" | findstr /C:"LISTENING" >nul 2>&1
+if not errorlevel 1 goto pg_ready
+set /a PG_WAIT+=1
+if %PG_WAIT% geq 30 (
+    echo ERROR: PostgreSQL did not start within 30 seconds. Aborting.
+    pause
+    exit /b 1
+)
+timeout /t 1 >nul
+goto wait_pg
+:pg_ready
+echo PostgreSQL is ready.
 
 echo Starting Backend FastAPI...
 start "Planning Backend" cmd /k "cd /d %WEB_DIR% && call venv\Scripts\activate.bat && python -m uvicorn main:app --host 127.0.0.1 --port %BACKEND_PORT% --reload"
