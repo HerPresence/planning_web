@@ -51,3 +51,6 @@ htmlcov/
 
 # Google credentials (may contain sensitive data)
 google_credentials.json
+logs/
+__pycache__/
+*.pyc
