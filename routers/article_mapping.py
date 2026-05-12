@@ -53,9 +53,6 @@ def get_import_sources():
     conn = get_connection()
     cur = conn.cursor()
 
-    ensure_import_sources_table(cur)
-    conn.commit()
-
     cur.execute(
         """
         SELECT
@@ -101,12 +98,103 @@ def get_import_sources():
     return result
 
 
+def ensure_import_sources_standalone():
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS import_sources (
+                id               SERIAL PRIMARY KEY,
+                source_name      TEXT NOT NULL,
+                source_type      TEXT,
+                source_url       TEXT,
+                article_id_field TEXT,
+                article_name_field TEXT,
+                article_type_field TEXT,
+                level1_field     TEXT,
+                level2_field     TEXT,
+                pnl_id_field     TEXT,
+                is_active        BOOLEAN DEFAULT TRUE
+            )
+            """
+        )
+        conn.commit()
+    except Exception as exc:
+        print(f"[startup] ensure_import_sources warning: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.put("/{source_id}")
+def update_import_source(
+    source_id: int,
+    data: ImportSourceCreate,
+):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE import_sources
+        SET source_name = %s,
+            source_type = %s,
+            source_url = %s,
+            article_id_field = %s,
+            article_name_field = %s,
+            article_type_field = %s,
+            level1_field = %s,
+            level2_field = %s,
+            pnl_id_field = %s
+        WHERE id = %s
+        """,
+        (
+            data.source_name,
+            data.source_type,
+            data.source_url,
+            data.article_id_field,
+            data.article_name_field,
+            data.article_type_field,
+            data.level1_field,
+            data.level2_field,
+            data.pnl_id_field,
+            source_id,
+        ),
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"status": "ok"}
+
+
+@router.delete("/{source_id}")
+def delete_import_source(source_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        "UPDATE import_sources SET is_active = FALSE WHERE id = %s",
+        (source_id,),
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"status": "ok"}
+
+
 @router.post("")
 def create_import_source(data: ImportSourceCreate):
     conn = get_connection()
     cur = conn.cursor()
-
-    ensure_import_sources_table(cur)
 
     cur.execute(
         """

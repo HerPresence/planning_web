@@ -4,32 +4,24 @@ from db import get_connection
 router = APIRouter(prefix="/api/reference", tags=["reference"])
 
 
-def has_active_flag(table_name):
-    conn = get_connection()
-    cur = conn.cursor()
+def _has_active_flag(cur, table_name):
     cur.execute(
-        "SELECT 1 FROM information_schema.columns WHERE table_name=%s AND column_name='is_active'",
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = %s AND column_name = 'is_active'",
         (table_name,),
     )
-    result = cur.fetchone() is not None
-    cur.close()
-    conn.close()
-    return result
-
-
-def active_filter(table_name):
-    if has_active_flag(table_name):
-        return "WHERE is_active IS TRUE"
-    return ""
+    return cur.fetchone() is not None
 
 
 @router.get("/departments")
 def get_departments():
     conn = get_connection()
     cur = conn.cursor()
-    clause = active_filter("dim_department")
+    clause = "WHERE is_active IS TRUE" if _has_active_flag(cur, "dim_department") else ""
     cur.execute(
-        f"SELECT department_id, holding_name, organization_name, region_name, branch_name, department_name FROM dim_department {clause} ORDER BY holding_name, organization_name, region_name, branch_name, department_name"
+        f"SELECT department_id, holding_name, organization_name, region_name, branch_name, department_name "
+        f"FROM dim_department {clause} "
+        f"ORDER BY holding_name, organization_name, region_name, branch_name, department_name"
     )
     rows = cur.fetchall()
     cur.close()
@@ -51,9 +43,11 @@ def get_departments():
 def get_articles():
     conn = get_connection()
     cur = conn.cursor()
-    clause = active_filter("dim_article")
+    clause = "WHERE is_active IS TRUE" if _has_active_flag(cur, "dim_article") else ""
     cur.execute(
-        f"SELECT article_id, article_name, article_type, level1, level2, pnl_id FROM dim_article {clause} ORDER BY article_name"
+        f"SELECT article_id, article_name, article_type, level1, level2, pnl_id "
+        f"FROM dim_article {clause} "
+        f"ORDER BY article_name"
     )
     rows = cur.fetchall()
     cur.close()

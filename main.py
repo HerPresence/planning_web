@@ -6,8 +6,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from routers.articles import router as articles_router, ensure_article_table
-from routers.article_mapping import router as mapping_router
+from routers.article_mapping import router as mapping_router, ensure_import_sources_standalone
 from routers.article_import import router as import_router
+from routers.pnl_import import (
+    router as pnl_import_router,
+    ensure_article_mapping_table,
+    ensure_department_mapping_table,
+)
 from routers.departments import router as departments_router, ensure_department_table
 from routers.pnl_data import router as pnl_data_router
 from routers.reference_data import router as reference_data_router
@@ -31,6 +36,9 @@ def init_db():
     ensure_branch_table()
     ensure_source_table()
     ensure_pnl_structure_table()
+    ensure_import_sources_standalone()
+    ensure_article_mapping_table()
+    ensure_department_mapping_table()
 
 
 # CORS
@@ -62,6 +70,7 @@ app.include_router(regions_router)
 app.include_router(branches_router)
 app.include_router(sources_router)
 app.include_router(pnl_structure_router)
+app.include_router(pnl_import_router)
 
 
 FRONT_BUILD_DIR = r"T:\planning_front\build"

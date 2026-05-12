@@ -7,21 +7,28 @@ router = APIRouter(prefix="/api/regions")
 def ensure_region_table():
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dim_region (
-            region_id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-            region_name TEXT NOT NULL,
-            is_active BOOLEAN DEFAULT true
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dim_region (
+                region_id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+                region_name TEXT NOT NULL,
+                is_active BOOLEAN DEFAULT true
+            )
+            """
         )
-        """
-    )
-    cur.execute("ALTER TABLE dim_region DROP COLUMN IF EXISTS organization_id")
-
-    conn.commit()
-    cur.close()
-    conn.close()
+        cur.execute("SET lock_timeout = '3s'")
+        cur.execute("ALTER TABLE dim_region DROP COLUMN IF EXISTS organization_id")
+        conn.commit()
+    except Exception as exc:
+        print(f"[startup] ensure_region_table warning: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        cur.close()
+        conn.close()
 
 
 @router.get("")

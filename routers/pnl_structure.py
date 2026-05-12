@@ -9,30 +9,36 @@ SUBTOTAL_GROUPS = {"ebitda", "ebit", "ebt", "netprofit", "net profit"}
 def ensure_pnl_structure_table():
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pnl_structure (
-            id SERIAL PRIMARY KEY,
-            pnl_code TEXT,
-            pnl_name TEXT NOT NULL,
-            pnl_group TEXT,
-            pnl_level INTEGER DEFAULT 1,
-            pnl_order INTEGER DEFAULT 0,
-            pnl_sign INTEGER DEFAULT 1,
-            parent_id INTEGER NULL,
-            is_total BOOLEAN DEFAULT FALSE,
-            is_active BOOLEAN DEFAULT TRUE
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pnl_structure (
+                id SERIAL PRIMARY KEY,
+                pnl_code TEXT,
+                pnl_name TEXT NOT NULL,
+                pnl_group TEXT,
+                pnl_level INTEGER DEFAULT 1,
+                pnl_order INTEGER DEFAULT 0,
+                pnl_sign INTEGER DEFAULT 1,
+                parent_id INTEGER NULL,
+                is_total BOOLEAN DEFAULT FALSE,
+                is_active BOOLEAN DEFAULT TRUE
+            )
+            """
         )
-        """
-    )
-
-    cur.execute("ALTER TABLE pnl_structure ADD COLUMN IF NOT EXISTS pnl_order INTEGER DEFAULT 0")
-    cur.execute("ALTER TABLE pnl_structure ADD COLUMN IF NOT EXISTS pnl_sign INTEGER DEFAULT 1")
-
-    conn.commit()
-    cur.close()
-    conn.close()
+        cur.execute("SET lock_timeout = '3s'")
+        cur.execute("ALTER TABLE pnl_structure ADD COLUMN IF NOT EXISTS pnl_order INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE pnl_structure ADD COLUMN IF NOT EXISTS pnl_sign INTEGER DEFAULT 1")
+        conn.commit()
+    except Exception as exc:
+        print(f"[startup] ensure_pnl_structure_table warning: {exc}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        cur.close()
+        conn.close()
 
 
 def calculate_pnl_level(cur, parent_id):
