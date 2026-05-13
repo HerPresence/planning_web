@@ -54,3 +54,4 @@ google_credentials.json
 logs/
 __pycache__/
 *.pyc
+google_credentials.json 
