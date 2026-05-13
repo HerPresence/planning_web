@@ -68,6 +68,7 @@ def get_import_sources():
             pnl_id_field,
             is_active
         FROM import_sources
+        WHERE is_active IS TRUE
         ORDER BY id DESC
         """
     )

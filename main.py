@@ -12,6 +12,7 @@ from routers.pnl_import import (
     router as pnl_import_router,
     ensure_article_mapping_table,
     ensure_department_mapping_table,
+    ensure_pnl_column_mapping_table,
 )
 from routers.departments import router as departments_router, ensure_department_table
 from routers.pnl_data import router as pnl_data_router
@@ -39,6 +40,7 @@ def init_db():
     ensure_import_sources_standalone()
     ensure_article_mapping_table()
     ensure_department_mapping_table()
+    ensure_pnl_column_mapping_table()
 
 
 # CORS
