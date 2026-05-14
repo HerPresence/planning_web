@@ -21,50 +21,52 @@ set "PG_ISREADY=%PG_BIN%\pg_isready.exe"
 REM ─── 1. PostgreSQL ────────────────────────────────────────────────────────────
 echo [1/3] PostgreSQL...
 
+REM Step 1: already ready — nothing to do
 "%PG_ISREADY%" -h 127.0.0.1 -p 5432 -q >nul 2>&1
 if not errorlevel 1 (
     echo   Already running.
     goto pg_ready
 )
 
-REM Not responding — clean up stale state before starting
-echo   Not responding. Cleaning up stale state...
+REM Step 2: check service state (1=STOPPED 2=START_PENDING 3=STOP_PENDING 4=RUNNING)
+for /f "tokens=3" %%s in ('sc query PlanningPostgreSQL ^| findstr "STATE"') do set "PG_STATE_NUM=%%s"
+echo   Service state code: %PG_STATE_NUM%
 
-REM Release any resources held by the service (ghost socket / shared memory)
-sc stop PlanningPostgreSQL >nul 2>&1
-timeout /t 3 >nul
-
-REM Kill any process still holding port 5432
-for /f "tokens=5" %%P in ('netstat -ano ^| findstr /C:":5432 " ^| findstr /C:"LISTENING"') do (
-    taskkill /F /PID %%P >nul 2>&1
+REM Step 3: only start if explicitly STOPPED
+if "%PG_STATE_NUM%"=="1" (
+    echo   Service is STOPPED — starting...
+    net start PlanningPostgreSQL >nul 2>&1
+) else (
+    echo   Service is already starting or running — waiting for pg_isready...
 )
 
-REM Remove stale pid file if present
-if exist "%PG_DATA%\postmaster.pid" del /f /q "%PG_DATA%\postmaster.pid" >nul 2>&1
-
-timeout /t 2 >nul
-
-REM Start the service
-echo   Starting PlanningPostgreSQL...
-net start PlanningPostgreSQL >nul 2>&1
-
+REM Step 4: wait up to 60 seconds, polling every 2 seconds
 set "PG_WAIT=0"
 :wait_pg
 "%PG_ISREADY%" -h 127.0.0.1 -p 5432 -q >nul 2>&1
 if not errorlevel 1 goto pg_ready
-set /a PG_WAIT+=1
-if %PG_WAIT% geq 60 (
-    echo.
-    echo   ERROR: PostgreSQL did not start in 60 seconds.
-    echo   Try manually: sc stop PlanningPostgreSQL ^& net start PlanningPostgreSQL
-    pause
-    exit /b 1
-)
+set /a PG_WAIT+=2
+if %PG_WAIT% geq 60 goto pg_timeout
 if %PG_WAIT%==10 echo   Waiting for PostgreSQL... (%PG_WAIT%s)
 if %PG_WAIT%==30 echo   Waiting for PostgreSQL... (%PG_WAIT%s)
 if %PG_WAIT%==50 echo   Waiting for PostgreSQL... (%PG_WAIT%s)
-timeout /t 1 >nul
+timeout /t 2 /nobreak >nul
 goto wait_pg
+
+:pg_timeout
+echo.
+echo   ERROR: PostgreSQL did not become ready within 60 seconds.
+echo   --- sc query PlanningPostgreSQL ---
+sc query PlanningPostgreSQL
+echo   --- netstat :5432 ---
+netstat -ano | findstr :5432
+echo.
+echo   Manual check:
+echo     "%PG_BIN%\pg_isready.exe" -h 127.0.0.1 -p 5432
+echo.
+echo   Start aborted. Fix PostgreSQL manually and re-run.
+pause
+exit /b 1
 
 :pg_ready
 echo   [OK] PostgreSQL is ready.

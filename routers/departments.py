@@ -103,7 +103,7 @@ def create_department(
 
 @router.put("/{old_department_id}")
 def update_department(
-    old_department_id: int,
+    old_department_id: str,
     holding_name: str = Form(""),
     organization_name: str = Form(""),
     region_name: str = Form(""),

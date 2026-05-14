@@ -1,6 +1,8 @@
 import csv
 import io
+import json
 import os
+import subprocess
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -19,6 +21,12 @@ try:
     _OPENPYXL_AVAILABLE = True
 except ImportError:
     _OPENPYXL_AVAILABLE = False
+
+try:
+    import pyodbc
+    _PYODBC_AVAILABLE = True
+except ImportError:
+    _PYODBC_AVAILABLE = False
 
 router = APIRouter(prefix="/api/pnl-import")
 
@@ -220,6 +228,242 @@ def _read_file(file_bytes: bytes, filename: str, sheet_name: Optional[str] = Non
     raise ValueError(f"Непідтримуваний формат файлу: {filename}")
 
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+# SQL Server ODBC drivers (for sql_odbc mode only)
+_ODBC_DRIVERS_MSSQL = [
+    "ODBC Driver 18 for SQL Server",
+    "ODBC Driver 17 for SQL Server",
+    "ODBC Driver 13 for SQL Server",
+    "SQL Server Native Client 11.0",
+    "SQL Server",
+]
+
+# PowerShell script that executes DAX via ADOMD.NET (OLE DB — no Python .NET binding needed)
+_PS_SSAS_SCRIPT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "read_ssas_dax.ps1")
+)
+
+_SSAS_ADOMD_NOT_FOUND_MSG = (
+    "Microsoft Analysis Services ADOMD.NET client не знайдено.\n"
+    "Встановіть Microsoft OLE DB Provider for Analysis Services:\n"
+    "  https://learn.microsoft.com/en-us/analysis-services/client-libraries\n"
+    "  або запустіть install_olap.bat"
+)
+
+
+# ── DB config helper ──────────────────────────────────────────────────────────
+
+def _get_olap_source_config(source_id: int):
+    """Fetch OLAP source settings from import_sources."""
+    conn_db = get_connection()
+    cur = conn_db.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT db_server, db_port, db_database, db_cube_model,
+                   db_login, db_password, db_query
+            FROM import_sources
+            WHERE id = %s AND is_active = TRUE
+            """,
+            (source_id,),
+        )
+        return cur.fetchone()
+    finally:
+        cur.close()
+        conn_db.close()
+
+
+# ── Connection string builders ────────────────────────────────────────────────
+
+def _build_mssql_conn_str(db_server, db_port, db_database, db_login, db_password,
+                           driver) -> str:
+    """ODBC connection string for regular SQL Server (pyodbc)."""
+    server_part = f"{db_server},{db_port}" if db_port else db_server
+    db_part = f";DATABASE={db_database}" if db_database else ""
+    if db_login and db_password:
+        return (
+            f"DRIVER={{{driver}}};"
+            f"SERVER={server_part}{db_part};"
+            f"UID={db_login};PWD={db_password};"
+            f"TrustServerCertificate=yes"
+        )
+    return (
+        f"DRIVER={{{driver}}};"
+        f"SERVER={server_part}{db_part};"
+        f"Trusted_Connection=yes;TrustServerCertificate=yes"
+    )
+
+
+# ── SSAS Tabular / DAX via PowerShell + ADOMD.NET ────────────────────────────
+
+def _run_ssas_ps(db_server, db_port, db_database, db_login, db_password,
+                 db_query, max_rows: int = 0) -> dict:
+    """Call read_ssas_dax.ps1 via subprocess; return parsed JSON dict."""
+    if not os.path.isfile(_PS_SSAS_SCRIPT):
+        raise FileNotFoundError(
+            f"PowerShell SSAS script not found: {_PS_SSAS_SCRIPT}. "
+            "Ensure tools/read_ssas_dax.ps1 exists in the project root."
+        )
+
+    server = f"{db_server}:{db_port}" if db_port else db_server
+    cmd = [
+        "powershell.exe",
+        "-NoProfile", "-NonInteractive",
+        "-ExecutionPolicy", "Bypass",
+        "-File", _PS_SSAS_SCRIPT,
+        "-Server", server,
+        "-Database", db_database,
+        "-Query", db_query,
+    ]
+    if db_login:
+        cmd += ["-Login", db_login]
+    if db_password:
+        cmd += ["-Password", db_password]
+    if max_rows > 0:
+        cmd += ["-MaxRows", str(max_rows)]
+
+    print(f"[SSAS-DAX] PS  server={server!r}  catalog={db_database!r}")
+    print(f"[SSAS-DAX] query ({len(db_query)} chars): {db_query[:150]}...")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=130,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "powershell.exe не знайдено. Переконайтесь, що backend запущено на Windows."
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("PowerShell SSAS script перевищив таймаут (130 с).")
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+
+    if not stdout:
+        raise RuntimeError(
+            f"PowerShell не повернув жодних даних (exit {proc.returncode}).\n"
+            f"stderr: {stderr[:400]}"
+        )
+
+    # stdout may have debug Write-Host lines before the JSON — find the JSON object
+    json_line = ""
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            json_line = line
+            break
+
+    if not json_line:
+        raise RuntimeError(
+            f"PowerShell не повернув JSON (exit {proc.returncode}).\n"
+            f"stdout: {stdout[:400]}"
+        )
+
+    try:
+        data = json.loads(json_line)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"PowerShell повернув невалідний JSON: {exc}\nraw: {json_line[:300]}"
+        )
+
+    return data
+
+
+def _read_ssas_dax(source_id: int) -> tuple:
+    """Execute a DAX query against SSAS Tabular via PowerShell + ADOMD.NET."""
+    cfg = _get_olap_source_config(source_id)
+    if not cfg:
+        raise ValueError(f"Джерело ID={source_id} не знайдено або неактивне")
+
+    db_server, db_port, db_database, db_cube_model, db_login, db_password, db_query = cfg
+
+    if not db_server:
+        raise ValueError("db_server не вказано у налаштуваннях джерела")
+    if not db_database:
+        raise ValueError("db_database (Initial Catalog) не вказано у налаштуваннях джерела")
+    if not db_query:
+        raise ValueError("db_query (DAX) не вказано у налаштуваннях джерела")
+
+    data = _run_ssas_ps(db_server, db_port, db_database, db_login, db_password, db_query)
+
+    if "error" in data:
+        raise RuntimeError(
+            f"SSAS DAX помилка ({db_server}/{db_database}): {data['error']}\n"
+            f"Перевірте: сервер доступний (порт 2383/2382), каталог '{db_database}' існує в SSAS."
+        )
+
+    columns = data.get("columns", [])
+    rows = data.get("rows", [])
+    print(f"[SSAS-DAX] {len(rows)} рядків, колонки: {columns}")
+    return rows, []
+
+
+# ── Regular SQL Server via ODBC (pyodbc) ──────────────────────────────────────
+
+def _read_sql_odbc(source_id: int) -> tuple:
+    """Execute a SQL query against SQL Server via ODBC Driver (pyodbc)."""
+    if not _PYODBC_AVAILABLE:
+        raise RuntimeError(
+            "pyodbc не встановлено. Запустіть: pip install pyodbc"
+        )
+
+    cfg = _get_olap_source_config(source_id)
+    if not cfg:
+        raise ValueError(f"Джерело ID={source_id} не знайдено або неактивне")
+
+    db_server, db_port, db_database, db_cube_model, db_login, db_password, db_query = cfg
+
+    if not db_server:
+        raise ValueError("db_server не вказано у налаштуваннях джерела")
+    if not db_query:
+        raise ValueError("db_query не вказано у налаштуваннях джерела")
+
+    print(f"[SQL-ODBC] server={db_server!r}  db={db_database!r}")
+    errors = []
+
+    for driver in _ODBC_DRIVERS_MSSQL:
+        try:
+            conn_str = _build_mssql_conn_str(
+                db_server, db_port, db_database, db_login, db_password, driver
+            )
+            print(f"[SQL-ODBC] Спроба: {driver!r}")
+            conn = pyodbc.connect(conn_str, timeout=30)
+            print(f"[SQL-ODBC] {driver!r} — підключено")
+            cur = conn.cursor()
+            cur.execute(db_query)
+            columns = [desc[0] for desc in cur.description]
+            rows = [
+                {columns[i]: ("" if r[i] is None else r[i]) for i in range(len(columns))}
+                for r in cur.fetchall()
+            ]
+            conn.close()
+            print(f"[SQL-ODBC] {len(rows)} рядків, колонки: {columns}")
+            return rows, []
+        except Exception as exc:
+            msg = f"{driver}: {exc}"
+            print(f"[SQL-ODBC] {msg}")
+            errors.append(msg)
+
+    raise RuntimeError(
+        f"Не вдалося підключитись до SQL Server ({db_server}/{db_database}). "
+        f"Встановіть 'ODBC Driver 17 for SQL Server' або новіший. "
+        f"Деталі: {'; '.join(errors)}"
+    )
+
+
+# ── Backward-compat wrapper (olap_sql legacy) ─────────────────────────────────
+
+def _read_olap(source_id: int) -> tuple:
+    """Legacy olap_sql alias — routes to SSAS DAX via PowerShell."""
+    return _read_ssas_dax(source_id)
+
+
 def _normalize_code(val) -> str:
     """Convert Excel numeric codes to string: 2.0 → '2', 1014.0 → '1014'."""
     if val is None:
@@ -403,6 +647,151 @@ def _count_existing(cur, import_type: str, scenario: str, version_name: str, per
         cur.execute("SELECT COUNT(*) FROM fact_pnl WHERE period = ANY(%s::date[])", (periods,))
     row = cur.fetchone()
     return row[0] if row else 0
+
+
+# ─── OLAP test connection ─────────────────────────────────────────────────────
+
+@router.get("/test-connection/{source_id}")
+def test_olap_connection(source_id: int, mode: str = "auto"):
+    """Diagnose DB/OLAP connectivity.
+
+    mode:
+      auto          — detect from source_type in import_sources
+      olap_ssas_dax — SSAS Tabular via ADOMD.NET/pyadomd (DAX queries)
+      olap_sql      — same as olap_ssas_dax (legacy alias)
+      sql_odbc      — SQL Server via ODBC Driver 17/18
+    """
+    result = {
+        "source_id": source_id,
+        "mode": mode,
+        # SSAS/DAX transport — PowerShell + ADOMD.NET
+        "ssas_transport": "PowerShell + ADOMD.NET (OLE DB)",
+        "ps_script": _PS_SSAS_SCRIPT,
+        "ps_script_exists": os.path.isfile(_PS_SSAS_SCRIPT),
+        # pyodbc / SQL Server ODBC
+        "pyodbc_available": _PYODBC_AVAILABLE,
+        "mssql_drivers_found": [],
+        # Connection test
+        "connection_ok": False,
+        "driver_used": None,
+        "columns": [],
+        "rows_preview": [],
+        "attempts": [],
+        "server": None,
+        "database": None,
+        "cube_model": None,
+        "query_preview": "",
+        "error": None,
+    }
+
+    # 1. Source config
+    cfg = _get_olap_source_config(source_id)
+    if not cfg:
+        result["error"] = f"Джерело ID={source_id} не знайдено або неактивне"
+        return result
+
+    db_server, db_port, db_database, db_cube_model, db_login, db_password, db_query = cfg
+    result["server"]        = f"{db_server}:{db_port}" if db_port else db_server
+    result["database"]      = db_database
+    result["cube_model"]    = db_cube_model
+    result["query_preview"] = (db_query or "")[:300]
+
+    if not db_server:
+        result["error"] = "db_server не вказано у налаштуваннях джерела"
+        return result
+    if not db_query:
+        result["error"] = "db_query не вказано у налаштуваннях джерела"
+        return result
+
+    # 2. Detect effective mode from source_type when mode == "auto"
+    effective_mode = mode
+    if effective_mode == "auto":
+        conn_db = get_connection()
+        cur_db  = conn_db.cursor()
+        try:
+            cur_db.execute("SELECT source_type FROM import_sources WHERE id = %s", (source_id,))
+            row_st = cur_db.fetchone()
+            effective_mode = (row_st[0] or "olap_ssas_dax") if row_st else "olap_ssas_dax"
+        finally:
+            cur_db.close()
+            conn_db.close()
+    result["mode"] = effective_mode
+
+    # 3. SSAS Tabular / DAX — via PowerShell + ADOMD.NET
+    if effective_mode in ("olap_ssas_dax", "olap_sql"):
+        label = "PowerShell/ADOMD.NET"
+        if not result["ps_script_exists"]:
+            result["error"] = (
+                f"PowerShell SSAS script not found: {_PS_SSAS_SCRIPT}. "
+                "Переконайтесь, що tools/read_ssas_dax.ps1 є в директорії проекту."
+            )
+            result["attempts"].append({"driver": label, "ok": False, "error": result["error"]})
+            return result
+
+        try:
+            data = _run_ssas_ps(
+                db_server, db_port, db_database, db_login, db_password,
+                db_query, max_rows=3
+            )
+            if "error" in data:
+                raise RuntimeError(data["error"])
+            cols = data.get("columns", [])
+            rows_preview = data.get("rows", [])
+            result["connection_ok"] = True
+            result["driver_used"]   = label
+            result["columns"]       = cols
+            result["rows_preview"]  = rows_preview[:3]
+            result["attempts"].append({"driver": label, "ok": True, "error": None})
+        except Exception as exc:
+            err = str(exc)
+            result["attempts"].append({"driver": label, "ok": False, "error": err})
+            result["error"] = (
+                f"SSAS підключення невдале: {err}\n"
+                f"Перевірте: сервер {db_server} доступний (порт 2383), "
+                f"каталог '{db_database}' існує в SSAS, облікові дані коректні."
+            )
+        return result
+
+    # 4. SQL Server via ODBC (pyodbc)
+    if effective_mode == "sql_odbc":
+        if not _PYODBC_AVAILABLE:
+            result["error"] = "pyodbc не встановлено. Запустіть: pip install pyodbc"
+            return result
+
+        all_drivers = pyodbc.drivers()
+        result["mssql_drivers_found"] = [
+            d for d in all_drivers if any(k in d for k in ("SQL Server", "MSSQL"))
+        ]
+
+        for driver in _ODBC_DRIVERS_MSSQL:
+            try:
+                conn_str = _build_mssql_conn_str(
+                    db_server, db_port, db_database, db_login, db_password, driver
+                )
+                c = pyodbc.connect(conn_str, timeout=10)
+                cur = c.cursor()
+                cur.execute(db_query)
+                cols = [d[0] for d in cur.description]
+                raw = cur.fetchmany(3)
+                c.close()
+                rows_preview = [
+                    {cols[i]: ("" if r[i] is None else str(r[i])) for i in range(len(cols))}
+                    for r in raw
+                ]
+                result["connection_ok"] = True
+                result["driver_used"]   = driver
+                result["columns"]       = cols
+                result["rows_preview"]  = rows_preview
+                result["attempts"].append({"driver": driver, "ok": True, "error": None})
+                return result
+            except Exception as exc:
+                result["attempts"].append({"driver": driver, "ok": False, "error": str(exc)})
+
+        result["error"] = "Всі ODBC-драйвери невдалі. Дивіться поле attempts."
+        return result
+
+    result["error"] = f"Невідомий mode: {effective_mode!r}. Очікується olap_ssas_dax / sql_odbc."
+    return result
 
 
 # ─── article mapping CRUD ─────────────────────────────────────────────────────
@@ -759,12 +1148,25 @@ def save_pnl_column_mapping(
 @router.post("/preview")
 async def preview_source(
     source_type: str = Form(...),
+    source_id: Optional[int] = Form(None),
     file: Optional[UploadFile] = File(None),
     sheet_url: Optional[str] = Form(None),
     sheet_name: Optional[str] = Form(None),
 ):
     try:
-        if source_type == "google_sheets":
+        if source_type == "olap_ssas_dax":
+            if not source_id:
+                raise HTTPException(status_code=400, detail="source_id потрібен для SSAS DAX джерела")
+            rows, sheet_names = _read_ssas_dax(source_id)
+        elif source_type == "sql_odbc":
+            if not source_id:
+                raise HTTPException(status_code=400, detail="source_id потрібен для SQL ODBC джерела")
+            rows, sheet_names = _read_sql_odbc(source_id)
+        elif source_type == "olap_sql":
+            if not source_id:
+                raise HTTPException(status_code=400, detail="source_id потрібен для OLAP джерела")
+            rows, sheet_names = _read_olap(source_id)
+        elif source_type == "google_sheets":
             if not sheet_url:
                 raise HTTPException(
                     status_code=400, detail="Потрібно вказати посилання на Google Sheet"
@@ -795,7 +1197,22 @@ async def preview_source(
 
 # ─── shared source reader ────────────────────────────────────────────────────
 
-async def _read_source(source_type, file, sheet_url, sheet_name):
+_DB_SOURCE_TYPES = {"olap_ssas_dax", "sql_odbc", "olap_sql"}
+
+
+async def _read_source(source_type, file, sheet_url, sheet_name, source_id=None):
+    if source_type == "olap_ssas_dax":
+        if not source_id:
+            raise HTTPException(status_code=400, detail="source_id потрібен для SSAS DAX джерела")
+        return _read_ssas_dax(source_id)
+    if source_type == "sql_odbc":
+        if not source_id:
+            raise HTTPException(status_code=400, detail="source_id потрібен для SQL ODBC джерела")
+        return _read_sql_odbc(source_id)
+    if source_type == "olap_sql":
+        if not source_id:
+            raise HTTPException(status_code=400, detail="source_id потрібен для OLAP джерела")
+        return _read_olap(source_id)
     if source_type == "google_sheets":
         if not sheet_url:
             raise HTTPException(status_code=400, detail="Потрібно вказати посилання на Google Sheet")
@@ -829,7 +1246,7 @@ async def validate_import(
     comment_col: str = Form(""),
 ):
     try:
-        rows, _ = await _read_source(source_type, file, sheet_url, sheet_name)
+        rows, _ = await _read_source(source_type, file, sheet_url, sheet_name, source_id)
     except HTTPException:
         raise
     except Exception as exc:
@@ -885,7 +1302,7 @@ async def commit_import(
     replace_existing: str = Form("false"),
 ):
     try:
-        rows, _ = await _read_source(source_type, file, sheet_url, sheet_name)
+        rows, _ = await _read_source(source_type, file, sheet_url, sheet_name, source_id)
     except HTTPException:
         raise
     except Exception as exc:
