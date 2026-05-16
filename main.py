@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from routers.articles import router as articles_router, ensure_article_table
 from routers.article_mapping import router as mapping_router, ensure_import_sources_standalone
 from routers.article_import import router as import_router
+from routers.article_source_mapping import router as article_source_mapping_router
 from routers.pnl_import import (
     router as pnl_import_router,
     ensure_article_mapping_table,
@@ -23,6 +24,10 @@ from routers.regions import router as regions_router, ensure_region_table
 from routers.branches import router as branches_router, ensure_branch_table
 from routers.sources import router as sources_router, ensure_source_table
 from routers.pnl_structure import router as pnl_structure_router, ensure_pnl_structure_table
+from services.article_import_service import (
+    ensure_source_staging_tables,
+    migrate_legacy_article_mappings,
+)
 
 app = FastAPI(title="Planning Web")
 
@@ -41,6 +46,8 @@ def init_db():
     ensure_article_mapping_table()
     ensure_department_mapping_table()
     ensure_pnl_column_mapping_table()
+    ensure_source_staging_tables()
+    migrate_legacy_article_mappings()
 
 
 # CORS
@@ -73,6 +80,7 @@ app.include_router(branches_router)
 app.include_router(sources_router)
 app.include_router(pnl_structure_router)
 app.include_router(pnl_import_router)
+app.include_router(article_source_mapping_router)
 
 
 FRONT_BUILD_DIR = r"T:\planning_front\build"
