@@ -18,18 +18,60 @@ from db import get_connection
 # ---- Static catalogue -------------------------------------------------------
 
 IMPORT_TYPES = [
-    {"code": "pnl_plan",               "name": "Plan PnL",                 "target_table": "plan_pnl"},
-    {"code": "pnl_fact",               "name": "Fakt PnL",                 "target_table": "fact_pnl"},
-    {"code": "sales_fact",             "name": "Fakt tovarooborotu",        "target_table": "fact_turnover"},
-    {"code": "sales_plan",             "name": "Plan tovarooborotu",        "target_table": "plan_turnover"},
-    {"code": "expense_budget",         "name": "Byudzhety vytrat",          "target_table": "budgets"},
-    {"code": "articles",               "name": "Statti PnL",                "target_table": "dim_article"},
-    {"code": "article_mapping",        "name": "Vidpovidnist statey",       "target_table": "article_mapping"},
-    {"code": "commercial_conditions",  "name": "Komertsiini umovy",         "target_table": "commercial_conditions"},
+    {"code": "pnl_plan",              "name": "План PnL",                      "target_table": "plan_pnl",            "staging_table": None},
+    {"code": "pnl_fact",              "name": "Факт PnL",                      "target_table": "fact_pnl",            "staging_table": None},
+    {"code": "sales_fact",            "name": "Факт продажів (товарооборот)",   "target_table": "fact_turnover",       "staging_table": "staging_sales_fact"},
+    {"code": "departments",           "name": "Підрозділи",                     "target_table": "dim_department",      "staging_table": "staging_departments"},
+    {"code": "brands",                "name": "Бренди / Номенклатурні групи",   "target_table": "dim_brand",           "staging_table": "staging_brands"},
+    {"code": "sales_plan",            "name": "План товарообороту",             "target_table": "plan_turnover",       "staging_table": None},
+    {"code": "expense_budget",        "name": "Бюджети витрат",                 "target_table": "budgets",             "staging_table": None},
+    {"code": "articles",              "name": "Статті PnL",                     "target_table": "dim_article",         "staging_table": "staging_articles"},
+    {"code": "article_mapping",       "name": "Відповідність статей",           "target_table": "article_mapping",     "staging_table": None},
+    {"code": "commercial_conditions", "name": "Комерційні умови",               "target_table": "commercial_conditions","staging_table": None},
 ]
 
 # Map import_type_code -> target_table
 _TYPE_TARGET = {t["code"]: t["target_table"] for t in IMPORT_TYPES}
+_TYPE_STAGING = {t["code"]: t["staging_table"] for t in IMPORT_TYPES if t["staging_table"]}
+
+DEPARTMENTS_DEFAULT_FIELDS = [
+    {"source_field": "UIDПідрозділ",               "target_field": "department_uid",            "required": True},
+    {"source_field": "Підрозділ",                  "target_field": "department_name",           "required": True},
+    {"source_field": "UIDОсновнийПідрозділ",       "target_field": "parent_department_uid",     "required": False},
+    {"source_field": "ОсновнийПідрозділ",          "target_field": "parent_department_name",    "required": False},
+    {"source_field": "UIDВідокремленийПідрозділ",  "target_field": "separated_department_uid",  "required": False},
+    {"source_field": "ВідокремленийПідрозділ",     "target_field": "separated_department_name", "required": False},
+    {"source_field": "Організація",                "target_field": "organization_name",         "required": False},
+    {"source_field": "Філія",                      "target_field": "branch_name",               "required": False},
+    {"source_field": "Регіон",                     "target_field": "region_name",               "required": False},
+    {"source_field": "Холдинг",                    "target_field": "holding_name",              "required": False},
+]
+
+BRANDS_DEFAULT_FIELDS = [
+    {"source_field": "UIDНоменклатурнаГрупаВитрат",        "target_field": "brand_uid",         "required": False},
+    {"source_field": "НоменклатурнаГрупаВитрат",           "target_field": "brand_name",        "required": True},
+    {"source_field": "UIDОсновнаНоменклатурнаГрупаВитрат", "target_field": "parent_brand_uid",  "required": False},
+    {"source_field": "ОсновнаНоменклатурнаГрупаВитрат",    "target_field": "parent_brand_name", "required": False},
+    {"source_field": "Level1",                              "target_field": "brand_group",       "required": False},
+]
+
+ARTICLES_DEFAULT_FIELDS = [
+    {"source_field": "UIDСтаттяВитрат",                  "target_field": "article_uid",      "required": True},
+    {"source_field": "СтаттяВитрат",                     "target_field": "article_name",     "required": True},
+    {"source_field": "ТипСтатті",                        "target_field": "article_type",     "required": False},
+    {"source_field": "Level1",                            "target_field": "level1",           "required": False},
+    {"source_field": "Level2",                            "target_field": "level2",           "required": False},
+    {"source_field": "КодPnL",                           "target_field": "pnl_code",         "required": False},
+    {"source_field": "НоменклатурнаГрупаВитрат",        "target_field": "expense_element",  "required": False},
+    {"source_field": "Компанія",                          "target_field": "expense_company",  "required": False},
+]
+
+DEFAULT_FIELDS_BY_TYPE = {
+    "sales_fact":  None,   # filled below after SALES_FACT_DEFAULT_FIELDS
+    "departments": DEPARTMENTS_DEFAULT_FIELDS,
+    "brands":      BRANDS_DEFAULT_FIELDS,
+    "articles":    ARTICLES_DEFAULT_FIELDS,
+}
 
 SALES_FACT_DEFAULT_FIELDS = [
     {"source_field": "Pidrozdil UIDPidrozdil",              "target_field": "department_uid",    "required": True},
@@ -44,6 +86,7 @@ SALES_FACT_DEFAULT_FIELDS = [
     {"source_field": "Prodazhi dal",                        "target_field": "sales_dal",         "required": False},
     {"source_field": "Prodazhi kh",                         "target_field": "sales_kg",          "required": False},
 ]
+DEFAULT_FIELDS_BY_TYPE["sales_fact"] = SALES_FACT_DEFAULT_FIELDS
 
 
 # ---- Table setup ------------------------------------------------------------
@@ -179,6 +222,102 @@ def ensure_import_engine_tables():
         cur.execute(
             "ALTER TABLE sf_bulk_update_log "
             "ALTER COLUMN master_id TYPE TEXT USING master_id::text"
+        )
+
+        # staging_departments
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS staging_departments (
+                id                       SERIAL PRIMARY KEY,
+                batch_id                 INTEGER NOT NULL,
+                import_type_code         TEXT DEFAULT 'departments',
+                department_uid           TEXT,
+                department_name          TEXT,
+                organization_name        TEXT,
+                branch_name              TEXT,
+                region_name              TEXT,
+                holding_name             TEXT,
+                parent_department_uid    TEXT,
+                parent_department_name   TEXT,
+                separated_department_uid  TEXT,
+                separated_department_name TEXT,
+                raw_row                  JSONB,
+                validation_status        TEXT DEFAULT 'pending',
+                validation_error         TEXT,
+                created_at               TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_staging_dept_batch ON staging_departments (batch_id)"
+        )
+
+        # staging_brands
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS staging_brands (
+                id                SERIAL PRIMARY KEY,
+                batch_id          INTEGER NOT NULL,
+                import_type_code  TEXT DEFAULT 'brands',
+                brand_uid         TEXT,
+                brand_name        TEXT,
+                brand_group       TEXT,
+                parent_brand_uid  TEXT,
+                parent_brand_name TEXT,
+                raw_row           JSONB,
+                validation_status TEXT DEFAULT 'pending',
+                validation_error  TEXT,
+                created_at        TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_staging_brands_batch ON staging_brands (batch_id)"
+        )
+
+        # staging_articles
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS staging_articles (
+                id                SERIAL PRIMARY KEY,
+                batch_id          INTEGER NOT NULL,
+                import_type_code  TEXT DEFAULT 'articles',
+                article_uid       TEXT,
+                article_name      TEXT,
+                article_type      TEXT,
+                level1            TEXT,
+                level2            TEXT,
+                pnl_code          TEXT,
+                expense_element   TEXT,
+                expense_company   TEXT,
+                raw_row           JSONB,
+                validation_status TEXT DEFAULT 'pending',
+                validation_error  TEXT,
+                created_at        TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_staging_art_batch ON staging_articles (batch_id)"
+        )
+
+        # Ensure dim_brand has UNIQUE brand_uid + parent columns
+        cur.execute(
+            "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS parent_brand_uid  TEXT"
+        )
+        cur.execute(
+            "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS parent_brand_name TEXT"
+        )
+        cur.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'dim_brand'::regclass
+                    AND conname = 'dim_brand_brand_uid_key'
+                ) THEN
+                    ALTER TABLE dim_brand ADD CONSTRAINT dim_brand_brand_uid_key
+                        UNIQUE (brand_uid);
+                END IF;
+            END $$
+        """)
+
+        # staging_table column on import_batches
+        cur.execute(
+            "ALTER TABLE import_batches ADD COLUMN IF NOT EXISTS staging_table TEXT"
         )
 
         cur.execute("""
@@ -1050,6 +1189,663 @@ def get_fact_turnover(
             "period_from": str(agg[6]) if agg[6] else None,
             "period_to":   str(agg[7]) if agg[7] else None,
         }
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEPARTMENTS IMPORT HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_departments_to_staging(batch_id: int, rows: list, field_mapping: list) -> tuple:
+    """Apply mapping + validate + write to staging_departments.
+    Returns (rows_loaded, rows_failed, rows_valid, rows_invalid).
+    """
+    if not rows:
+        return 0, 0, 0, 0
+
+    conn = get_connection()
+    cur = conn.cursor()
+    rows_loaded = rows_failed = rows_valid = rows_invalid = 0
+
+    try:
+        for i, row in enumerate(rows):
+            mapped, _ = _apply_mapping(row, field_mapping)
+
+            dept_uid  = str(mapped.get("department_uid")  or "").strip()
+            dept_name = str(mapped.get("department_name") or "").strip()
+            org_name  = str(mapped.get("organization_name") or "").strip()
+            branch    = str(mapped.get("branch_name")  or "").strip()
+            region    = str(mapped.get("region_name")  or "").strip()
+            holding   = str(mapped.get("holding_name") or "").strip()
+            p_uid     = str(mapped.get("parent_department_uid")  or "").strip()
+            p_name    = str(mapped.get("parent_department_name") or "").strip()
+            s_uid     = str(mapped.get("separated_department_uid")  or "").strip()
+            s_name    = str(mapped.get("separated_department_name") or "").strip()
+
+            errors = []
+            if not dept_uid:
+                errors.append("Empty department_uid")
+            if not dept_name:
+                errors.append("Empty department_name")
+
+            v_status = "invalid" if errors else "valid"
+            v_error  = "; ".join(errors) if errors else None
+            if v_status == "valid":
+                rows_valid += 1
+            else:
+                rows_invalid += 1
+
+            try:
+                raw_json = json.dumps(row, default=str, ensure_ascii=False)
+            except Exception:
+                raw_json = None
+
+            try:
+                cur.execute(
+                    """INSERT INTO staging_departments
+                       (batch_id, import_type_code,
+                        department_uid, department_name, organization_name,
+                        branch_name, region_name, holding_name,
+                        parent_department_uid, parent_department_name,
+                        separated_department_uid, separated_department_name,
+                        raw_row, validation_status, validation_error)
+                       VALUES (%s,'departments',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)""",
+                    (batch_id, dept_uid, dept_name, org_name, branch, region, holding,
+                     p_uid, p_name, s_uid, s_name, raw_json, v_status, v_error),
+                )
+                rows_loaded += 1
+            except Exception as exc:
+                rows_failed += 1
+                print(f"[staging_dept] row #{i} error: {exc}")
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+    return rows_loaded, rows_failed, rows_valid, rows_invalid
+
+
+def get_departments_staging_preview(batch_id: int, limit: int = 500,
+                                    status_filter: Optional[str] = None) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT COUNT(*),
+                      COUNT(*) FILTER (WHERE validation_status = 'valid'),
+                      COUNT(*) FILTER (WHERE validation_status = 'invalid')
+               FROM staging_departments WHERE batch_id = %s""",
+            (batch_id,),
+        )
+        agg = cur.fetchone()
+
+        where_extra = ""
+        params = [batch_id]
+        if status_filter in ("valid", "invalid"):
+            where_extra = " AND validation_status = %s"
+            params.append(status_filter)
+        params.append(limit)
+
+        cur.execute(
+            f"""SELECT id, department_uid, department_name, organization_name,
+                       branch_name, region_name, holding_name,
+                       parent_department_uid, parent_department_name,
+                       validation_status, validation_error, raw_row
+                FROM staging_departments
+                WHERE batch_id = %s{where_extra}
+                ORDER BY validation_status DESC, id
+                LIMIT %s""",
+            params,
+        )
+        rows_data = cur.fetchall()
+
+        return {
+            "total":   agg[0] or 0,
+            "valid":   agg[1] or 0,
+            "invalid": agg[2] or 0,
+            "rows": [
+                {
+                    "id": r[0],
+                    "department_uid":           r[1],
+                    "department_name":          r[2],
+                    "organization_name":        r[3],
+                    "branch_name":              r[4],
+                    "region_name":              r[5],
+                    "holding_name":             r[6],
+                    "parent_department_uid":    r[7],
+                    "parent_department_name":   r[8],
+                    "validation_status":        r[9],
+                    "validation_error":         r[10],
+                    "raw_row":                  r[11],
+                }
+                for r in rows_data
+            ],
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+def commit_departments(batch_id: int) -> dict:
+    """Upsert valid staging_departments rows into dim_department."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT department_uid, department_name, organization_name,
+                      branch_name, region_name, holding_name
+               FROM staging_departments
+               WHERE batch_id = %s AND validation_status = 'valid' AND department_uid != ''""",
+            (batch_id,),
+        )
+        staging_rows = cur.fetchall()
+
+        upserted = inserted = updated = 0
+        for r in staging_rows:
+            dept_uid, dept_name, org_name, branch, region, holding = r
+
+            cur.execute("SELECT 1 FROM dim_department WHERE department_id = %s", (dept_uid,))
+            exists = cur.fetchone()
+            if exists:
+                cur.execute(
+                    """UPDATE dim_department SET
+                       department_name    = %s,
+                       organization_name  = %s,
+                       branch_name        = %s,
+                       region_name        = %s,
+                       holding_name       = %s,
+                       is_active          = true,
+                       is_deleted         = false
+                       WHERE department_id = %s""",
+                    (dept_name, org_name, branch, region, holding, dept_uid),
+                )
+                updated += 1
+            else:
+                cur.execute(
+                    """INSERT INTO dim_department
+                       (department_id, department_name, organization_name,
+                        branch_name, region_name, holding_name, is_active)
+                       VALUES (%s, %s, %s, %s, %s, %s, true)""",
+                    (dept_uid, dept_name, org_name, branch, region, holding),
+                )
+                inserted += 1
+            upserted += 1
+
+        conn.commit()
+        return {"upserted": upserted, "inserted": inserted, "updated": updated}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BRANDS IMPORT HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_brands_to_staging(batch_id: int, rows: list, field_mapping: list) -> tuple:
+    """Apply mapping + validate + write to staging_brands.
+    Returns (rows_loaded, rows_failed, rows_valid, rows_invalid).
+    """
+    if not rows:
+        return 0, 0, 0, 0
+
+    conn = get_connection()
+    cur = conn.cursor()
+    rows_loaded = rows_failed = rows_valid = rows_invalid = 0
+
+    try:
+        for i, row in enumerate(rows):
+            mapped, _ = _apply_mapping(row, field_mapping)
+
+            brand_uid   = str(mapped.get("brand_uid")   or "").strip()
+            brand_name  = str(mapped.get("brand_name")  or "").strip()
+            brand_group = str(mapped.get("brand_group") or "").strip()
+            p_uid  = str(mapped.get("parent_brand_uid")  or "").strip()
+            p_name = str(mapped.get("parent_brand_name") or "").strip()
+
+            errors = []
+            if not brand_name:
+                errors.append("Empty brand_name")
+
+            v_status = "invalid" if errors else "valid"
+            v_error  = "; ".join(errors) if errors else None
+            if v_status == "valid":
+                rows_valid += 1
+            else:
+                rows_invalid += 1
+
+            try:
+                raw_json = json.dumps(row, default=str, ensure_ascii=False)
+            except Exception:
+                raw_json = None
+
+            try:
+                cur.execute(
+                    """INSERT INTO staging_brands
+                       (batch_id, import_type_code,
+                        brand_uid, brand_name, brand_group,
+                        parent_brand_uid, parent_brand_name,
+                        raw_row, validation_status, validation_error)
+                       VALUES (%s,'brands',%s,%s,%s,%s,%s,%s::jsonb,%s,%s)""",
+                    (batch_id, brand_uid or None, brand_name, brand_group or None,
+                     p_uid or None, p_name or None, raw_json, v_status, v_error),
+                )
+                rows_loaded += 1
+            except Exception as exc:
+                rows_failed += 1
+                print(f"[staging_brands] row #{i} error: {exc}")
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+    return rows_loaded, rows_failed, rows_valid, rows_invalid
+
+
+def get_brands_staging_preview(batch_id: int, limit: int = 500,
+                               status_filter: Optional[str] = None) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT COUNT(*),
+                      COUNT(*) FILTER (WHERE validation_status = 'valid'),
+                      COUNT(*) FILTER (WHERE validation_status = 'invalid')
+               FROM staging_brands WHERE batch_id = %s""",
+            (batch_id,),
+        )
+        agg = cur.fetchone()
+
+        where_extra = ""
+        params = [batch_id]
+        if status_filter in ("valid", "invalid"):
+            where_extra = " AND validation_status = %s"
+            params.append(status_filter)
+        params.append(limit)
+
+        cur.execute(
+            f"""SELECT id, brand_uid, brand_name, brand_group,
+                       parent_brand_uid, parent_brand_name,
+                       validation_status, validation_error, raw_row
+                FROM staging_brands
+                WHERE batch_id = %s{where_extra}
+                ORDER BY validation_status DESC, id
+                LIMIT %s""",
+            params,
+        )
+        rows_data = cur.fetchall()
+
+        return {
+            "total":   agg[0] or 0,
+            "valid":   agg[1] or 0,
+            "invalid": agg[2] or 0,
+            "rows": [
+                {
+                    "id": r[0],
+                    "brand_uid":         r[1],
+                    "brand_name":        r[2],
+                    "brand_group":       r[3],
+                    "parent_brand_uid":  r[4],
+                    "parent_brand_name": r[5],
+                    "validation_status": r[6],
+                    "validation_error":  r[7],
+                    "raw_row":           r[8],
+                }
+                for r in rows_data
+            ],
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+def commit_brands(batch_id: int) -> dict:
+    """Upsert valid staging_brands rows into dim_brand."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT brand_uid, brand_name, brand_group, parent_brand_uid, parent_brand_name
+               FROM staging_brands
+               WHERE batch_id = %s AND validation_status = 'valid' AND brand_name != ''""",
+            (batch_id,),
+        )
+        staging_rows = cur.fetchall()
+
+        upserted = inserted = updated = 0
+        for r in staging_rows:
+            brand_uid, brand_name, brand_group, p_uid, p_name = r
+
+            if brand_uid:
+                cur.execute(
+                    """INSERT INTO dim_brand
+                       (brand_uid, brand_name, brand_group, parent_brand_uid, parent_brand_name, is_active)
+                       VALUES (%s, %s, %s, %s, %s, true)
+                       ON CONFLICT (brand_uid) DO UPDATE SET
+                         brand_name        = EXCLUDED.brand_name,
+                         brand_group       = EXCLUDED.brand_group,
+                         parent_brand_uid  = EXCLUDED.parent_brand_uid,
+                         parent_brand_name = EXCLUDED.parent_brand_name,
+                         is_active         = true,
+                         updated_at        = NOW()
+                       RETURNING (xmax = 0) AS is_insert""",
+                    (brand_uid, brand_name, brand_group or None, p_uid or None, p_name or None),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    inserted += 1
+                else:
+                    updated += 1
+            else:
+                cur.execute(
+                    "SELECT id FROM dim_brand WHERE LOWER(TRIM(brand_name)) = LOWER(TRIM(%s)) AND COALESCE(is_deleted, false) = false LIMIT 1",
+                    (brand_name,),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    cur.execute(
+                        """UPDATE dim_brand SET brand_group = %s, parent_brand_uid = %s,
+                           parent_brand_name = %s, is_active = true, updated_at = NOW()
+                           WHERE id = %s""",
+                        (brand_group or None, p_uid or None, p_name or None, existing[0]),
+                    )
+                    updated += 1
+                else:
+                    cur.execute(
+                        """INSERT INTO dim_brand (brand_name, brand_group, parent_brand_uid, parent_brand_name, is_active)
+                           VALUES (%s, %s, %s, %s, true)""",
+                        (brand_name, brand_group or None, p_uid or None, p_name or None),
+                    )
+                    inserted += 1
+            upserted += 1
+
+        conn.commit()
+        return {"upserted": upserted, "inserted": inserted, "updated": updated}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ARTICLES handlers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_articles_to_staging(batch_id: int, rows: list, field_mapping: list):
+    """Map OLAP rows → staging_articles, validate, return counts."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        loaded = failed = valid = invalid = 0
+        for raw in rows:
+            mapped, _ = _apply_mapping(raw, field_mapping)
+            article_uid  = str(mapped.get("article_uid") or "").strip() or None
+            article_name = str(mapped.get("article_name") or "").strip() or None
+            article_type = str(mapped.get("article_type") or "").strip() or None
+            level1       = str(mapped.get("level1") or "").strip() or None
+            level2       = str(mapped.get("level2") or "").strip() or None
+            pnl_code     = str(mapped.get("pnl_code") or "").strip() or None
+            exp_elem     = str(mapped.get("expense_element") or "").strip() or None
+            exp_comp     = str(mapped.get("expense_company") or "").strip() or None
+
+            errors = []
+            if not article_name:
+                errors.append("article_name is required")
+
+            vstatus = "invalid" if errors else "valid"
+            verror  = "; ".join(errors) if errors else None
+            if vstatus == "valid":
+                valid += 1
+            else:
+                invalid += 1
+
+            cur.execute(
+                """INSERT INTO staging_articles
+                   (batch_id, article_uid, article_name, article_type, level1, level2,
+                    pnl_code, expense_element, expense_company, raw_row,
+                    validation_status, validation_error)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (batch_id, article_uid, article_name, article_type, level1, level2,
+                 pnl_code, exp_elem, exp_comp,
+                 json.dumps(raw, default=str), vstatus, verror),
+            )
+            loaded += 1
+
+        conn.commit()
+        return loaded, failed, valid, invalid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_articles_staging_preview(batch_id: int, limit: int = 500, status_filter=None) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cond = "WHERE batch_id = %s"
+        params = [batch_id]
+        if status_filter:
+            cond += " AND validation_status = %s"
+            params.append(status_filter)
+
+        cur.execute(
+            f"""SELECT id, article_uid, article_name, article_type,
+                       level1, level2, pnl_code, expense_element, expense_company,
+                       validation_status, validation_error, raw_row
+                FROM staging_articles {cond} ORDER BY id LIMIT %s""",
+            params + [limit],
+        )
+        rows = [
+            {
+                "id": r[0], "article_uid": r[1], "article_name": r[2],
+                "article_type": r[3], "level1": r[4], "level2": r[5],
+                "pnl_code": r[6], "expense_element": r[7], "expense_company": r[8],
+                "validation_status": r[9], "validation_error": r[10],
+                "raw_row": r[11],
+            }
+            for r in cur.fetchall()
+        ]
+
+        cur.execute(
+            "SELECT COUNT(*) FROM staging_articles WHERE batch_id = %s", (batch_id,)
+        )
+        total = cur.fetchone()[0]
+        cur.execute(
+            "SELECT COUNT(*) FROM staging_articles WHERE batch_id = %s AND validation_status = 'valid'",
+            (batch_id,),
+        )
+        valid = cur.fetchone()[0]
+        return {"rows": rows, "total": total, "valid": valid, "invalid": total - valid}
+    finally:
+        cur.close()
+        conn.close()
+
+
+def commit_articles(batch_id: int) -> dict:
+    """Upsert valid staging_articles rows into dim_article."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT article_uid, article_name, article_type, level1, level2,
+                      pnl_code, expense_element, expense_company
+               FROM staging_articles
+               WHERE batch_id = %s AND validation_status = 'valid'""",
+            (batch_id,),
+        )
+        staging_rows = cur.fetchall()
+        upserted = inserted = updated = 0
+
+        for (art_uid, art_name, art_type, lv1, lv2,
+             pnl_code, exp_elem, exp_comp) in staging_rows:
+
+            # Resolve pnl_id from pnl_code
+            pnl_id = None
+            if pnl_code:
+                cur.execute(
+                    "SELECT id FROM pnl_structure WHERE pnl_code = %s LIMIT 1",
+                    (pnl_code,),
+                )
+                row = cur.fetchone()
+                if row:
+                    pnl_id = row[0]
+
+            # Use article_uid as article_id (PK); fall back to article_name slug
+            article_id = art_uid or art_name
+
+            cur.execute(
+                """INSERT INTO dim_article
+                   (article_id, article_name, article_type, level1, level2, pnl_id,
+                    uid_expense_article, expense_element, expense_company, is_active)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,true)
+                   ON CONFLICT (article_id) DO UPDATE SET
+                     article_name    = EXCLUDED.article_name,
+                     article_type    = COALESCE(EXCLUDED.article_type, dim_article.article_type),
+                     level1          = COALESCE(EXCLUDED.level1,        dim_article.level1),
+                     level2          = COALESCE(EXCLUDED.level2,        dim_article.level2),
+                     pnl_id          = COALESCE(EXCLUDED.pnl_id,        dim_article.pnl_id),
+                     expense_element = COALESCE(EXCLUDED.expense_element,dim_article.expense_element),
+                     expense_company = COALESCE(EXCLUDED.expense_company,dim_article.expense_company),
+                     is_active       = true
+                   RETURNING (xmax = 0) AS is_insert""",
+                (article_id, art_name, art_type or None, lv1 or None, lv2 or None,
+                 pnl_id, art_uid or None, exp_elem or None, exp_comp or None),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                inserted += 1
+            else:
+                updated += 1
+            upserted += 1
+
+        # update batch
+        cur.execute(
+            """UPDATE import_batches
+               SET status = 'committed', finished_at = NOW(), rows_loaded_to_target = %s
+               WHERE id = %s""",
+            (upserted, batch_id),
+        )
+        # mark staging rows committed
+        cur.execute(
+            "UPDATE staging_articles SET validation_status = 'committed' WHERE batch_id = %s AND validation_status = 'valid'",
+            (batch_id,),
+        )
+        conn.commit()
+        return {"upserted": upserted, "inserted": inserted, "updated": updated}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIVERSAL DISPATCH
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def universal_load_to_staging(
+    batch_id: int,
+    rows: list,
+    field_mapping: list,
+    import_type_code: str,
+    period_from=None,
+    period_to=None,
+) -> tuple:
+    """Dispatch to type-specific staging loader.
+    Returns (rows_loaded, rows_failed, rows_filtered_out, rows_valid, rows_invalid).
+    """
+    if import_type_code == "sales_fact":
+        return load_sales_fact_to_staging(batch_id, rows, field_mapping, period_from, period_to)
+    elif import_type_code == "departments":
+        loaded, failed, valid, invalid = load_departments_to_staging(batch_id, rows, field_mapping)
+        return loaded, failed, 0, valid, invalid
+    elif import_type_code == "brands":
+        loaded, failed, valid, invalid = load_brands_to_staging(batch_id, rows, field_mapping)
+        return loaded, failed, 0, valid, invalid
+    elif import_type_code == "articles":
+        loaded, failed, valid, invalid = load_articles_to_staging(batch_id, rows, field_mapping)
+        return loaded, failed, 0, valid, invalid
+    else:
+        raise ValueError(f"Import type '{import_type_code}' not yet supported in staging engine")
+
+
+def universal_get_staging_preview(
+    batch_id: int,
+    import_type_code: str,
+    limit: int = 500,
+    status_filter: Optional[str] = None,
+) -> dict:
+    if import_type_code == "departments":
+        return get_departments_staging_preview(batch_id, limit=limit, status_filter=status_filter)
+    elif import_type_code == "brands":
+        return get_brands_staging_preview(batch_id, limit=limit, status_filter=status_filter)
+    elif import_type_code == "articles":
+        return get_articles_staging_preview(batch_id, limit=limit, status_filter=status_filter)
+    else:
+        return get_staging_preview(batch_id, limit=limit, status_filter=status_filter)
+
+
+def universal_commit(
+    batch_id: int,
+    import_type_code: str,
+    source_id: Optional[int] = None,
+    period_from=None,
+    period_to=None,
+) -> dict:
+    if import_type_code == "sales_fact":
+        committed, deleted = commit_sales_fact(batch_id, source_id, period_from, period_to)
+        return {"committed": committed, "deleted_from_target": deleted}
+    elif import_type_code == "departments":
+        return commit_departments(batch_id)
+    elif import_type_code == "brands":
+        return commit_brands(batch_id)
+    elif import_type_code == "articles":
+        return commit_articles(batch_id)
+    else:
+        raise ValueError(f"Import type '{import_type_code}' commit not implemented")
+
+
+def rollback_batch(batch_id: int) -> dict:
+    """Delete staging rows for a batch (soft-rollback; dimension records are kept)."""
+    batch = get_batch(batch_id)
+    if not batch:
+        raise ValueError(f"Batch {batch_id} not found")
+
+    import_type_code = batch["import_type_code"]
+    staging_table = _TYPE_STAGING.get(import_type_code)
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        deleted_staging = 0
+        if staging_table:
+            cur.execute(f"DELETE FROM {staging_table} WHERE batch_id = %s", (batch_id,))
+            deleted_staging = cur.rowcount
+        update_batch(batch_id, status="rolled_back")
+        conn.commit()
+        return {"deleted_staging": deleted_staging, "import_type_code": import_type_code}
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         cur.close()
         conn.close()

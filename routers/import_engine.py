@@ -14,7 +14,10 @@ from auth.dependencies import get_current_user
 from db import get_connection
 from services.import_engine import (
     IMPORT_TYPES,
+    DEFAULT_FIELDS_BY_TYPE,
     SALES_FACT_DEFAULT_FIELDS,
+    DEPARTMENTS_DEFAULT_FIELDS,
+    BRANDS_DEFAULT_FIELDS,
     bulk_update_staging_sales_fact,
     commit_sales_fact,
     create_batch,
@@ -27,6 +30,10 @@ from services.import_engine import (
     load_sales_fact_to_staging,
     save_field_mapping,
     update_batch,
+    universal_load_to_staging,
+    universal_get_staging_preview,
+    universal_commit,
+    rollback_batch as svc_rollback_batch,
 )
 from routers.pnl_import import _read_ssas_dax, _read_sql_odbc
 
@@ -119,8 +126,10 @@ def get_mapping(source_id: int, _u=Depends(get_current_user)):
                 "SELECT import_type_code FROM import_sources WHERE id = %s", (source_id,)
             )
             row = cur.fetchone()
-            if row and row[0] == "sales_fact":
-                return SALES_FACT_DEFAULT_FIELDS
+            if row and row[0]:
+                defaults = DEFAULT_FIELDS_BY_TYPE.get(row[0])
+                if defaults:
+                    return defaults
         finally:
             cur.close()
             conn.close()
@@ -170,7 +179,7 @@ def preview_source(source_id: int, _u=Depends(get_current_user)):
 
     return {
         "columns": list(rows[0].keys()),
-        "preview_rows": rows[:10],
+        "preview_rows": rows[:20],
         "total_rows": len(rows),
     }
 
@@ -209,13 +218,14 @@ def load_to_staging(
     source_type = row[0] or "olap_ssas_dax"
     import_type_code = row[1] or "sales_fact"
 
-    if import_type_code != "sales_fact":
+    SUPPORTED_TYPES = {"sales_fact", "departments", "brands", "articles"}
+    if import_type_code not in SUPPORTED_TYPES:
         raise HTTPException(
             400,
             f"Type '{import_type_code}' not supported here. Use /api/pnl-import/ for PnL."
         )
 
-    # Parse period dates
+    # Parse period dates (required for sales_fact, optional for others)
     pf = _parse_date_str(period_from) if period_from else None
     pt = _parse_date_str(period_to)   if period_to   else None
 
@@ -237,7 +247,7 @@ def load_to_staging(
 
     field_mapping = get_field_mapping(source_id)
     if not field_mapping:
-        field_mapping = SALES_FACT_DEFAULT_FIELDS
+        field_mapping = DEFAULT_FIELDS_BY_TYPE.get(import_type_code) or []
 
     batch_id = create_batch(
         source_id, import_type_code,
@@ -249,7 +259,10 @@ def load_to_staging(
 
     try:
         rows_loaded, rows_failed, rows_filtered_out, rows_valid, rows_invalid = (
-            load_sales_fact_to_staging(batch_id, raw_rows, field_mapping, pf, pt)
+            universal_load_to_staging(
+                batch_id, raw_rows, field_mapping, import_type_code,
+                period_from=pf, period_to=pt,
+            )
         )
         update_batch(
             batch_id,
@@ -267,7 +280,7 @@ def load_to_staging(
                      finished_at=datetime.now())
         raise HTTPException(500, f"Error writing to staging: {exc}")
 
-    staging = get_staging_preview(batch_id)
+    staging = universal_get_staging_preview(batch_id, import_type_code)
     return {
         "batch_id": batch_id,
         "rows_total": len(raw_rows),
@@ -287,7 +300,12 @@ def load_to_staging(
 @router.get("/staging/{batch_id}")
 def staging_preview(batch_id: int, status_filter: Optional[str] = None,
                     limit: int = 500, _u=Depends(get_current_user)):
-    return get_staging_preview(batch_id, limit=limit, status_filter=status_filter)
+    batch = get_batch(batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    return universal_get_staging_preview(
+        batch_id, batch["import_type_code"], limit=limit, status_filter=status_filter
+    )
 
 
 # ---- Staging bulk-update (department / brand mapping) -----------------------
@@ -338,8 +356,10 @@ def commit_batch_endpoint(batch_id: int, _u=Depends(get_current_user)):
     if batch["status"] == "committed":
         raise HTTPException(400, "Batch already committed")
 
-    if batch["import_type_code"] != "sales_fact":
-        raise HTTPException(400, f"Type '{batch['import_type_code']}' not supported here")
+    import_type_code = batch["import_type_code"]
+    SUPPORTED_COMMIT = {"sales_fact", "departments", "brands"}
+    if import_type_code not in SUPPORTED_COMMIT:
+        raise HTTPException(400, f"Type '{import_type_code}' commit not supported here")
 
     pf = _parse_date_str(batch["period_from"]) if batch.get("period_from") else None
     pt = _parse_date_str(batch["period_to"])   if batch.get("period_to")   else None
@@ -347,12 +367,16 @@ def commit_batch_endpoint(batch_id: int, _u=Depends(get_current_user)):
 
     update_batch(batch_id, status="committing")
     try:
-        committed, deleted_from_target = commit_sales_fact(batch_id, source_id, pf, pt)
+        result = universal_commit(
+            batch_id, import_type_code, source_id=source_id,
+            period_from=pf, period_to=pt,
+        )
+        rows_to_target = result.get("committed") or result.get("upserted") or 0
         update_batch(
             batch_id,
             status="committed",
             finished_at=datetime.now(),
-            rows_loaded_to_target=committed,
+            rows_loaded_to_target=rows_to_target,
         )
     except Exception as exc:
         update_batch(batch_id, status="failed", error_message=str(exc)[:500],
@@ -362,8 +386,8 @@ def commit_batch_endpoint(batch_id: int, _u=Depends(get_current_user)):
     return {
         "ok": True,
         "batch_id": batch_id,
-        "committed": committed,
-        "deleted_from_target": deleted_from_target,
+        "import_type_code": import_type_code,
+        **result,
         "period_from": str(pf) if pf else None,
         "period_to":   str(pt) if pt else None,
     }
@@ -411,6 +435,21 @@ def delete_batch_endpoint(batch_id: int, delete_fact: bool = False,
         raise HTTPException(500, str(exc))
 
     return result
+
+
+# ---- Rollback ---------------------------------------------------------------
+
+@router.post("/batches/{batch_id}/rollback")
+def rollback_batch_endpoint(batch_id: int, _u=Depends(get_current_user)):
+    """Delete staging rows; for sales_fact also removes from target table."""
+    batch = get_batch(batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    try:
+        result = svc_rollback_batch(batch_id)
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+    return {"ok": True, **result}
 
 
 # ---- Fact Turnover view -----------------------------------------------------
