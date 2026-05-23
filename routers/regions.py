@@ -32,7 +32,8 @@ def ensure_region_table():
 
 
 @router.get("")
-def get_regions():
+def get_regions(
+):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -59,7 +60,7 @@ def get_regions():
 
 @router.post("")
 def create_region(
-    region_name: str = Form(...),
+    region_name: str = Form(...)
 ):
     conn = get_connection()
     cur = conn.cursor()
@@ -88,7 +89,7 @@ def create_region(
 def update_region(
     old_region_id: int,
     region_name: str = Form(...),
-    is_active: str = Form("true"),
+    is_active: str = Form("true")
 ):
     conn = get_connection()
     cur = conn.cursor()
@@ -112,12 +113,13 @@ def update_region(
 
 
 @router.delete("/{region_id}")
-def delete_region(region_id: str):
+def delete_region(region_id: str
+):
     conn = get_connection()
     cur = conn.cursor()
 
     cur.execute(
-        "UPDATE dim_region SET is_active = false WHERE region_id = %s",
+        "UPDATE dim_region SET is_active = false, is_deleted = true, deleted_at = NOW() WHERE region_id = %s",
         (region_id,),
     )
 
@@ -125,4 +127,18 @@ def delete_region(region_id: str):
     cur.close()
     conn.close()
 
+    return {"status": "ok"}
+
+
+@router.patch("/{region_id}/restore")
+def restore_region(region_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE dim_region SET is_active = true, is_deleted = false, deleted_at = NULL WHERE region_id = %s",
+        (region_id,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
     return {"status": "ok"}

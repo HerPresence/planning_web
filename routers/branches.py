@@ -25,7 +25,8 @@ def ensure_branch_table():
 
 
 @router.get("")
-def get_branches():
+def get_branches(
+):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -60,7 +61,7 @@ def get_branches():
 @router.post("")
 def create_branch(
     branch_name: str = Form(...),
-    region_id: int | None = Form(None),
+    region_id: int | None = Form(None)
 ):
     conn = get_connection()
     cur = conn.cursor()
@@ -91,7 +92,7 @@ def update_branch(
     old_branch_id: int,
     branch_name: str = Form(...),
     region_id: int | None = Form(None),
-    is_active: str = Form("true"),
+    is_active: str = Form("true")
 ):
     conn = get_connection()
     cur = conn.cursor()
@@ -115,12 +116,13 @@ def update_branch(
 
 
 @router.delete("/{branch_id}")
-def delete_branch(branch_id: str):
+def delete_branch(branch_id: str
+):
     conn = get_connection()
     cur = conn.cursor()
 
     cur.execute(
-        "UPDATE dim_branch SET is_active = false WHERE branch_id = %s",
+        "UPDATE dim_branch SET is_active = false, is_deleted = true, deleted_at = NOW() WHERE branch_id = %s",
         (branch_id,),
     )
 
@@ -128,4 +130,18 @@ def delete_branch(branch_id: str):
     cur.close()
     conn.close()
 
+    return {"status": "ok"}
+
+
+@router.patch("/{branch_id}/restore")
+def restore_branch(branch_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE dim_branch SET is_active = true, is_deleted = false, deleted_at = NULL WHERE branch_id = %s",
+        (branch_id,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
     return {"status": "ok"}

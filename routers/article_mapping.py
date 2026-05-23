@@ -10,6 +10,7 @@ class ImportSourceCreate(BaseModel):
     source_name: str
     source_type: str
     source_url: str | None = None
+    import_type_code: str | None = None
     # mapping fields — optional; not required for olap_sql sources
     article_id_field: str | None = None
     article_name_field: str | None = None
@@ -94,7 +95,8 @@ def get_import_sources():
             db_login,
             db_password,
             db_query,
-            db_refresh_interval
+            db_refresh_interval,
+            import_type_code
         FROM import_sources
         WHERE is_active IS TRUE
         ORDER BY id DESC
@@ -125,6 +127,7 @@ def get_import_sources():
                 "db_password": r[16],
                 "db_query": r[17],
                 "db_refresh_interval": r[18],
+                "import_type_code": r[19],
             }
         )
 
@@ -205,6 +208,7 @@ def update_import_source(
         SET source_name        = %s,
             source_type        = %s,
             source_url         = %s,
+            import_type_code   = %s,
             article_id_field   = %s,
             article_name_field = %s,
             article_type_field = %s,
@@ -225,6 +229,7 @@ def update_import_source(
             data.source_name,
             data.source_type,
             data.source_url or None,
+            data.import_type_code or None,
             data.article_id_field or None,
             data.article_name_field or None,
             data.article_type_field or None,
@@ -273,19 +278,20 @@ def create_import_source(data: ImportSourceCreate):
     cur.execute(
         """
         INSERT INTO import_sources (
-            source_name, source_type, source_url,
+            source_name, source_type, source_url, import_type_code,
             article_id_field, article_name_field, article_type_field,
             level1_field, level2_field, pnl_id_field,
             db_server, db_port, db_database, db_cube_model,
             db_login, db_password, db_query, db_refresh_interval,
             is_active
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE)
         """,
         (
             data.source_name,
             data.source_type,
             data.source_url or None,
+            data.import_type_code or None,
             data.article_id_field or None,
             data.article_name_field or None,
             data.article_type_field or None,

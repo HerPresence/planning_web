@@ -24,7 +24,8 @@ def ensure_holding_table():
 
 
 @router.get("")
-def get_holdings():
+def get_holdings(
+):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -51,7 +52,7 @@ def get_holdings():
 
 @router.post("")
 def create_holding(
-    holding_name: str = Form(...),
+    holding_name: str = Form(...)
 ):
     conn = get_connection()
     cur = conn.cursor()
@@ -80,7 +81,7 @@ def create_holding(
 def update_holding(
     old_holding_id: int,
     holding_name: str = Form(...),
-    is_active: str = Form("true"),
+    is_active: str = Form("true")
 ):
     conn = get_connection()
     cur = conn.cursor()
@@ -104,12 +105,13 @@ def update_holding(
 
 
 @router.delete("/{holding_id}")
-def delete_holding(holding_id: str):
+def delete_holding(holding_id: str
+):
     conn = get_connection()
     cur = conn.cursor()
 
     cur.execute(
-        "UPDATE dim_holding SET is_active = false WHERE holding_id = %s",
+        "UPDATE dim_holding SET is_active = false, is_deleted = true, deleted_at = NOW() WHERE holding_id = %s",
         (holding_id,),
     )
 
@@ -117,4 +119,18 @@ def delete_holding(holding_id: str):
     cur.close()
     conn.close()
 
+    return {"status": "ok"}
+
+
+@router.patch("/{holding_id}/restore")
+def restore_holding(holding_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE dim_holding SET is_active = true, is_deleted = false, deleted_at = NULL WHERE holding_id = %s",
+        (holding_id,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
     return {"status": "ok"}

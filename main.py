@@ -5,6 +5,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, PlainTextResponse
 
+from middleware.permission_middleware import PermissionMiddleware
+from services.audit_service import ensure_audit_table
+from services.soft_delete_service import ensure_soft_delete_columns
+
 from routers.articles import router as articles_router, ensure_article_table
 from routers.article_mapping import router as mapping_router, ensure_import_sources_standalone
 from routers.article_import import router as import_router
@@ -24,6 +28,12 @@ from routers.regions import router as regions_router, ensure_region_table
 from routers.branches import router as branches_router, ensure_branch_table
 from routers.sources import router as sources_router, ensure_source_table
 from routers.pnl_structure import router as pnl_structure_router, ensure_pnl_structure_table
+from routers.pnl_levels import router as pnl_levels_router, migrate_pnl_levels_from_articles
+from routers.admin_access import router as admin_access_router, ensure_admin_tables
+from routers.auth_router import router as auth_router
+from routers.import_engine import router as import_engine_router
+from services.import_engine import ensure_import_engine_tables
+from routers.brands import router as brands_router, ensure_brand_table
 from services.article_import_service import (
     ensure_source_staging_tables,
     migrate_legacy_article_mappings,
@@ -48,17 +58,31 @@ def init_db():
     ensure_pnl_column_mapping_table()
     ensure_source_staging_tables()
     migrate_legacy_article_mappings()
+    migrate_pnl_levels_from_articles()
+    ensure_admin_tables()
+    ensure_audit_table()
+    ensure_soft_delete_columns()
+    ensure_brand_table()
+    ensure_import_engine_tables()
 
+
+# Permission enforcement (must be added before CORS to run after it in Starlette chain)
+app.add_middleware(PermissionMiddleware)
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "http://localhost",
+        "http://127.0.0.1",
         "http://localhost:3000",
-        "http://127.0.0.1:8001",
+        "http://127.0.0.1:3000",
         "http://localhost:8001",
-        "http://127.0.0.1:8002",
+        "http://127.0.0.1:8001",
         "http://localhost:8002",
+        "http://127.0.0.1:8002",
+        "https://metricore.com.ua",
+        "http://metricore.com.ua",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -80,7 +104,12 @@ app.include_router(branches_router)
 app.include_router(sources_router)
 app.include_router(pnl_structure_router)
 app.include_router(pnl_import_router)
+app.include_router(pnl_levels_router)
 app.include_router(article_source_mapping_router)
+app.include_router(admin_access_router)
+app.include_router(auth_router)
+app.include_router(import_engine_router)
+app.include_router(brands_router)
 
 
 FRONT_BUILD_DIR = r"T:\planning_front\build"

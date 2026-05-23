@@ -25,7 +25,8 @@ def ensure_organization_table():
 
 
 @router.get("")
-def get_organizations():
+def get_organizations(
+):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -60,7 +61,7 @@ def get_organizations():
 @router.post("")
 def create_organization(
     organization_name: str = Form(...),
-    holding_id: int | None = Form(None),
+    holding_id: int | None = Form(None)
 ):
     conn = get_connection()
     cur = conn.cursor()
@@ -91,7 +92,7 @@ def update_organization(
     old_organization_id: int,
     organization_name: str = Form(...),
     holding_id: int | None = Form(None),
-    is_active: str = Form("true"),
+    is_active: str = Form("true")
 ):
     conn = get_connection()
     cur = conn.cursor()
@@ -115,12 +116,13 @@ def update_organization(
 
 
 @router.delete("/{organization_id}")
-def delete_organization(organization_id: str):
+def delete_organization(organization_id: str
+):
     conn = get_connection()
     cur = conn.cursor()
 
     cur.execute(
-        "UPDATE dim_organization SET is_active = false WHERE organization_id = %s",
+        "UPDATE dim_organization SET is_active = false, is_deleted = true, deleted_at = NOW() WHERE organization_id = %s",
         (organization_id,),
     )
 
@@ -128,4 +130,18 @@ def delete_organization(organization_id: str):
     cur.close()
     conn.close()
 
+    return {"status": "ok"}
+
+
+@router.patch("/{organization_id}/restore")
+def restore_organization(organization_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE dim_organization SET is_active = true, is_deleted = false, deleted_at = NULL WHERE organization_id = %s",
+        (organization_id,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
     return {"status": "ok"}

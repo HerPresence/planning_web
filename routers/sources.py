@@ -25,7 +25,8 @@ def ensure_source_table():
 
 
 @router.get("")
-def get_sources():
+def get_sources(
+):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -54,7 +55,7 @@ def get_sources():
 @router.post("")
 def create_source(
     source_name: str = Form(...),
-    source_type: str = Form(""),
+    source_type: str = Form("")
 ):
     conn = get_connection()
     cur = conn.cursor()
@@ -85,7 +86,7 @@ def update_source(
     old_source_id: int,
     source_name: str = Form(...),
     source_type: str = Form(""),
-    is_active: str = Form("true"),
+    is_active: str = Form("true")
 ):
     conn = get_connection()
     cur = conn.cursor()
@@ -109,12 +110,13 @@ def update_source(
 
 
 @router.delete("/{source_id}")
-def delete_source(source_id: str):
+def delete_source(source_id: str
+):
     conn = get_connection()
     cur = conn.cursor()
 
     cur.execute(
-        "UPDATE dim_source SET is_active = false WHERE source_id = %s",
+        "UPDATE dim_source SET is_active = false, is_deleted = true, deleted_at = NOW() WHERE source_id = %s",
         (source_id,),
     )
 
@@ -122,4 +124,18 @@ def delete_source(source_id: str):
     cur.close()
     conn.close()
 
+    return {"status": "ok"}
+
+
+@router.patch("/{source_id}/restore")
+def restore_source(source_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE dim_source SET is_active = true, is_deleted = false, deleted_at = NULL WHERE source_id = %s",
+        (source_id,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
     return {"status": "ok"}

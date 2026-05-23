@@ -204,7 +204,8 @@ def update_pnl_structure(
 
 
 @router.delete("/{id}")
-def delete_pnl_structure(id: int):
+def delete_pnl_structure(id: int
+):
     conn = get_connection()
     cur = conn.cursor()
 
