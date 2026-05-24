@@ -357,7 +357,7 @@ def commit_batch_endpoint(batch_id: int, _u=Depends(get_current_user)):
         raise HTTPException(400, "Batch already committed")
 
     import_type_code = batch["import_type_code"]
-    SUPPORTED_COMMIT = {"sales_fact", "departments", "brands"}
+    SUPPORTED_COMMIT = {"sales_fact", "departments", "brands", "articles"}
     if import_type_code not in SUPPORTED_COMMIT:
         raise HTTPException(400, f"Type '{import_type_code}' commit not supported here")
 
@@ -371,7 +371,12 @@ def commit_batch_endpoint(batch_id: int, _u=Depends(get_current_user)):
             batch_id, import_type_code, source_id=source_id,
             period_from=pf, period_to=pt,
         )
-        rows_to_target = result.get("committed") or result.get("upserted") or 0
+        rows_to_target = (
+            result.get("committed")
+            or result.get("upserted")
+            or (result.get("inserted", 0) + result.get("updated", 0))
+            or 0
+        )
         update_batch(
             batch_id,
             status="committed",

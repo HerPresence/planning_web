@@ -25,7 +25,7 @@ IMPORT_TYPES = [
     {"code": "brands",                "name": "Бренди / Номенклатурні групи",   "target_table": "dim_brand",           "staging_table": "staging_brands"},
     {"code": "sales_plan",            "name": "План товарообороту",             "target_table": "plan_turnover",       "staging_table": None},
     {"code": "expense_budget",        "name": "Бюджети витрат",                 "target_table": "budgets",             "staging_table": None},
-    {"code": "articles",              "name": "Статті PnL",                     "target_table": "dim_article",         "staging_table": "staging_articles"},
+    {"code": "articles",              "name": "Статті PnL",                     "target_table": "dim_article_source",  "staging_table": "staging_articles"},
     {"code": "article_mapping",       "name": "Відповідність статей",           "target_table": "article_mapping",     "staging_table": None},
     {"code": "commercial_conditions", "name": "Комерційні умови",               "target_table": "commercial_conditions","staging_table": None},
 ]
@@ -88,6 +88,43 @@ SALES_FACT_DEFAULT_FIELDS = [
 ]
 DEFAULT_FIELDS_BY_TYPE["sales_fact"] = SALES_FACT_DEFAULT_FIELDS
 
+# Canonical staging columns per import type.
+# ONLY these keys may map to physical columns; all others go into extra_fields JSONB.
+CANONICAL_STAGING_FIELDS: dict[str, frozenset] = {
+    "departments": frozenset({
+        "department_uid", "department_name", "organization_name",
+        "branch_name", "region_name", "holding_name",
+        "parent_department_uid", "parent_department_name",
+        "separated_department_uid", "separated_department_name",
+    }),
+    "brands": frozenset({
+        "brand_uid", "brand_name", "brand_group",
+        "parent_brand_uid", "parent_brand_name",
+    }),
+    "articles": frozenset({
+        "article_uid", "article_name", "article_type",
+        "level1", "level2", "pnl_code",
+        "expense_element", "expense_company",
+    }),
+    "sales_fact": frozenset({
+        "department_uid", "department_name", "product_group_id",
+        "product_group_uid", "product_group_name", "period_month",
+        "sales_vat", "sales_retail", "excise", "sales_dal", "sales_kg",
+    }),
+}
+
+_INTERNAL_KEYS = frozenset({"validation_status", "validation_error", "raw_row", "batch_id"})
+
+
+def _split_canonical_extra(mapped: dict, canonical: frozenset) -> tuple:
+    """Split mapping result into (canonical_dict, extra_dict).
+
+    canonical_dict  — keys in the staging table schema
+    extra_dict      — everything else (stored in extra_fields JSONB, never ALTER TABLE)
+    """
+    extra = {k: v for k, v in mapped.items() if k not in canonical and k not in _INTERNAL_KEYS}
+    return mapped, extra
+
 
 # ---- Table setup ------------------------------------------------------------
 
@@ -110,6 +147,25 @@ def ensure_import_engine_tables():
                 is_active        BOOLEAN DEFAULT TRUE,
                 UNIQUE (import_source_id, source_field)
             )
+        """)
+
+        # Drop old constraint that prevents same source_field → multiple target_fields
+        cur.execute("""
+            ALTER TABLE import_field_mapping
+            DROP CONSTRAINT IF EXISTS import_field_mapping_import_source_id_source_field_key
+        """)
+        cur.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'import_field_mapping'::regclass
+                    AND conname = 'uq_ifm_source_src_tgt'
+                ) THEN
+                    ALTER TABLE import_field_mapping
+                    ADD CONSTRAINT uq_ifm_source_src_tgt
+                    UNIQUE (import_source_id, source_field, target_field);
+                END IF;
+            END $$
         """)
 
         cur.execute("""
@@ -294,6 +350,54 @@ def ensure_import_engine_tables():
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_staging_art_batch ON staging_articles (batch_id)"
         )
+
+        # Add extra_fields JSONB to all staging tables (idempotent)
+        for _stg in ("staging_departments", "staging_brands",
+                     "staging_articles", "staging_sales_fact"):
+            cur.execute(
+                f"ALTER TABLE {_stg} ADD COLUMN IF NOT EXISTS extra_fields JSONB"
+            )
+
+        # ── Phase 0: Brand source registry (no data migration, no UI yet) ────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS dim_brand_source (
+                id                 SERIAL PRIMARY KEY,
+                source_id          INTEGER NOT NULL,
+                source_name        TEXT    DEFAULT '',
+                source_brand_id    TEXT    NOT NULL,
+                source_brand_name  TEXT    DEFAULT '',
+                source_brand_group TEXT    DEFAULT '',
+                source_parent_uid  TEXT    DEFAULT '',
+                source_parent_name TEXT    DEFAULT '',
+                extra_fields       JSONB,
+                loaded_at          TIMESTAMP DEFAULT NOW(),
+                is_active          BOOLEAN   DEFAULT TRUE,
+                UNIQUE (source_id, source_brand_id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS brand_source_mapping (
+                id               SERIAL PRIMARY KEY,
+                source_id        INTEGER NOT NULL,
+                source_brand_id  TEXT    NOT NULL,
+                master_brand_id  INTEGER,
+                mapping_status   TEXT    DEFAULT 'pending',
+                confidence       NUMERIC(5,2) DEFAULT 0,
+                mapped_by        INTEGER,
+                created_at       TIMESTAMP DEFAULT NOW(),
+                updated_at       TIMESTAMP DEFAULT NOW(),
+                UNIQUE (source_id, source_brand_id)
+            )
+        """)
+        for _idx_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_dbs_source_id        ON dim_brand_source(source_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dbs_source_brand_id  ON dim_brand_source(source_brand_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dbs_is_active        ON dim_brand_source(is_active)",
+            "CREATE INDEX IF NOT EXISTS idx_bsm_source_id        ON brand_source_mapping(source_id)",
+            "CREATE INDEX IF NOT EXISTS idx_bsm_mapping_status   ON brand_source_mapping(mapping_status)",
+            "CREATE INDEX IF NOT EXISTS idx_bsm_master_brand_id  ON brand_source_mapping(master_brand_id)",
+        ):
+            cur.execute(_idx_sql)
 
         # Ensure dim_brand has UNIQUE brand_uid + parent columns
         cur.execute(
@@ -680,10 +784,13 @@ def load_sales_fact_to_staging(
             else:
                 rows_invalid += 1
 
+            _, extra = _split_canonical_extra(mapped, CANONICAL_STAGING_FIELDS["sales_fact"])
+
             try:
                 raw_json = json.dumps(row, default=str, ensure_ascii=False)
             except Exception:
                 raw_json = None
+            extra_json = json.dumps(extra, default=str) if extra else None
 
             try:
                 cur.execute(
@@ -691,11 +798,11 @@ def load_sales_fact_to_staging(
                        (batch_id, period_month, department_uid, department_name,
                         product_group_id, product_group_uid, product_group_name,
                         sales_vat, sales_retail, excise, sales_dal, sales_kg,
-                        raw_row, validation_status, validation_error)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)""",
+                        raw_row, extra_fields, validation_status, validation_error)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)""",
                     (batch_id, period, dept_uid, dept_name, pg_id, pg_uid, pg_name,
                      sales_vat, sales_retail, excise, sales_dal, sales_kg,
-                     raw_json, v_status, v_error),
+                     raw_json, extra_json, v_status, v_error),
                 )
                 rows_loaded += 1
             except Exception as exc:
@@ -1212,6 +1319,7 @@ def load_departments_to_staging(batch_id: int, rows: list, field_mapping: list) 
     try:
         for i, row in enumerate(rows):
             mapped, _ = _apply_mapping(row, field_mapping)
+            _, extra = _split_canonical_extra(mapped, CANONICAL_STAGING_FIELDS["departments"])
 
             dept_uid  = str(mapped.get("department_uid")  or "").strip()
             dept_name = str(mapped.get("department_name") or "").strip()
@@ -1241,6 +1349,7 @@ def load_departments_to_staging(batch_id: int, rows: list, field_mapping: list) 
                 raw_json = json.dumps(row, default=str, ensure_ascii=False)
             except Exception:
                 raw_json = None
+            extra_json = json.dumps(extra, default=str) if extra else None
 
             try:
                 cur.execute(
@@ -1250,10 +1359,11 @@ def load_departments_to_staging(batch_id: int, rows: list, field_mapping: list) 
                         branch_name, region_name, holding_name,
                         parent_department_uid, parent_department_name,
                         separated_department_uid, separated_department_name,
-                        raw_row, validation_status, validation_error)
-                       VALUES (%s,'departments',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)""",
+                        raw_row, extra_fields, validation_status, validation_error)
+                       VALUES (%s,'departments',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                               %s::jsonb,%s::jsonb,%s,%s)""",
                     (batch_id, dept_uid, dept_name, org_name, branch, region, holding,
-                     p_uid, p_name, s_uid, s_name, raw_json, v_status, v_error),
+                     p_uid, p_name, s_uid, s_name, raw_json, extra_json, v_status, v_error),
                 )
                 rows_loaded += 1
             except Exception as exc:
@@ -1405,6 +1515,7 @@ def load_brands_to_staging(batch_id: int, rows: list, field_mapping: list) -> tu
     try:
         for i, row in enumerate(rows):
             mapped, _ = _apply_mapping(row, field_mapping)
+            _, extra = _split_canonical_extra(mapped, CANONICAL_STAGING_FIELDS["brands"])
 
             brand_uid   = str(mapped.get("brand_uid")   or "").strip()
             brand_name  = str(mapped.get("brand_name")  or "").strip()
@@ -1427,6 +1538,7 @@ def load_brands_to_staging(batch_id: int, rows: list, field_mapping: list) -> tu
                 raw_json = json.dumps(row, default=str, ensure_ascii=False)
             except Exception:
                 raw_json = None
+            extra_json = json.dumps(extra, default=str) if extra else None
 
             try:
                 cur.execute(
@@ -1434,10 +1546,10 @@ def load_brands_to_staging(batch_id: int, rows: list, field_mapping: list) -> tu
                        (batch_id, import_type_code,
                         brand_uid, brand_name, brand_group,
                         parent_brand_uid, parent_brand_name,
-                        raw_row, validation_status, validation_error)
-                       VALUES (%s,'brands',%s,%s,%s,%s,%s,%s::jsonb,%s,%s)""",
+                        raw_row, extra_fields, validation_status, validation_error)
+                       VALUES (%s,'brands',%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)""",
                     (batch_id, brand_uid or None, brand_name, brand_group or None,
-                     p_uid or None, p_name or None, raw_json, v_status, v_error),
+                     p_uid or None, p_name or None, raw_json, extra_json, v_status, v_error),
                 )
                 rows_loaded += 1
             except Exception as exc:
@@ -1594,6 +1706,8 @@ def load_articles_to_staging(batch_id: int, rows: list, field_mapping: list):
         loaded = failed = valid = invalid = 0
         for raw in rows:
             mapped, _ = _apply_mapping(raw, field_mapping)
+            _, extra = _split_canonical_extra(mapped, CANONICAL_STAGING_FIELDS["articles"])
+
             article_uid  = str(mapped.get("article_uid") or "").strip() or None
             article_name = str(mapped.get("article_name") or "").strip() or None
             article_type = str(mapped.get("article_type") or "").strip() or None
@@ -1602,6 +1716,7 @@ def load_articles_to_staging(batch_id: int, rows: list, field_mapping: list):
             pnl_code     = str(mapped.get("pnl_code") or "").strip() or None
             exp_elem     = str(mapped.get("expense_element") or "").strip() or None
             exp_comp     = str(mapped.get("expense_company") or "").strip() or None
+            extra_json   = json.dumps(extra, default=str) if extra else None
 
             errors = []
             if not article_name:
@@ -1618,11 +1733,11 @@ def load_articles_to_staging(batch_id: int, rows: list, field_mapping: list):
                 """INSERT INTO staging_articles
                    (batch_id, article_uid, article_name, article_type, level1, level2,
                     pnl_code, expense_element, expense_company, raw_row,
-                    validation_status, validation_error)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    extra_fields, validation_status, validation_error)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)""",
                 (batch_id, article_uid, article_name, article_type, level1, level2,
                  pnl_code, exp_elem, exp_comp,
-                 json.dumps(raw, default=str), vstatus, verror),
+                 json.dumps(raw, default=str), extra_json, vstatus, verror),
             )
             loaded += 1
 
@@ -1680,76 +1795,108 @@ def get_articles_staging_preview(batch_id: int, limit: int = 500, status_filter=
 
 
 def commit_articles(batch_id: int) -> dict:
-    """Upsert valid staging_articles rows into dim_article."""
+    """Write valid staging_articles → dim_article_source + article_source_mapping.
+
+    Rules:
+    - dim_article_source: upsert descriptive fields (never resets mapping state)
+    - article_source_mapping: insert as 'pending' only if row does not yet exist
+      (existing mapped/rejected rows are never touched)
+    - Does NOT write to dim_article.
+    """
+    from services.article_import_service import ensure_source_staging_tables
+    ensure_source_staging_tables()
+
     conn = get_connection()
     cur = conn.cursor()
     try:
+        # Resolve source_id from batch
+        cur.execute(
+            "SELECT import_source_id FROM import_batches WHERE id = %s",
+            (batch_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Batch {batch_id} not found")
+        source_id = row[0]
+
+        cur.execute("SELECT source_name FROM import_sources WHERE id = %s", (source_id,))
+        row = cur.fetchone()
+        source_name = row[0] if row else ""
+
+        # Fetch valid staging rows
         cur.execute(
             """SELECT article_uid, article_name, article_type, level1, level2,
-                      pnl_code, expense_element, expense_company
+                      expense_element, expense_company
                FROM staging_articles
                WHERE batch_id = %s AND validation_status = 'valid'""",
             (batch_id,),
         )
         staging_rows = cur.fetchall()
-        upserted = inserted = updated = 0
+        inserted_source = updated_source = new_mappings = 0
 
-        for (art_uid, art_name, art_type, lv1, lv2,
-             pnl_code, exp_elem, exp_comp) in staging_rows:
+        for (art_uid, art_name, art_type, lv1, lv2, exp_elem, exp_comp) in staging_rows:
+            source_article_id = (art_uid or "").strip() or (art_name or "").strip()
+            if not source_article_id:
+                continue
 
-            # Resolve pnl_id from pnl_code
-            pnl_id = None
-            if pnl_code:
-                cur.execute(
-                    "SELECT id FROM pnl_structure WHERE pnl_code = %s LIMIT 1",
-                    (pnl_code,),
-                )
-                row = cur.fetchone()
-                if row:
-                    pnl_id = row[0]
-
-            # Use article_uid as article_id (PK); fall back to article_name slug
-            article_id = art_uid or art_name
-
+            # Upsert descriptive fields into dim_article_source
             cur.execute(
-                """INSERT INTO dim_article
-                   (article_id, article_name, article_type, level1, level2, pnl_id,
-                    uid_expense_article, expense_element, expense_company, is_active)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,true)
-                   ON CONFLICT (article_id) DO UPDATE SET
-                     article_name    = EXCLUDED.article_name,
-                     article_type    = COALESCE(EXCLUDED.article_type, dim_article.article_type),
-                     level1          = COALESCE(EXCLUDED.level1,        dim_article.level1),
-                     level2          = COALESCE(EXCLUDED.level2,        dim_article.level2),
-                     pnl_id          = COALESCE(EXCLUDED.pnl_id,        dim_article.pnl_id),
-                     expense_element = COALESCE(EXCLUDED.expense_element,dim_article.expense_element),
-                     expense_company = COALESCE(EXCLUDED.expense_company,dim_article.expense_company),
-                     is_active       = true
+                """INSERT INTO dim_article_source
+                       (source_id, source_name, source_article_id, source_article_name,
+                        source_article_type, source_level1, source_level2,
+                        expense_element, expense_company, loaded_at, is_active)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),TRUE)
+                   ON CONFLICT (source_id, source_article_id) DO UPDATE SET
+                       source_name         = EXCLUDED.source_name,
+                       source_article_name = EXCLUDED.source_article_name,
+                       source_article_type = EXCLUDED.source_article_type,
+                       source_level1       = EXCLUDED.source_level1,
+                       source_level2       = EXCLUDED.source_level2,
+                       expense_element     = EXCLUDED.expense_element,
+                       expense_company     = EXCLUDED.expense_company,
+                       loaded_at           = NOW(),
+                       is_active           = TRUE
                    RETURNING (xmax = 0) AS is_insert""",
-                (article_id, art_name, art_type or None, lv1 or None, lv2 or None,
-                 pnl_id, art_uid or None, exp_elem or None, exp_comp or None),
+                (source_id, source_name, source_article_id,
+                 art_name or "", art_type or "", lv1 or "", lv2 or "",
+                 exp_elem or "", exp_comp or ""),
             )
             row = cur.fetchone()
             if row and row[0]:
-                inserted += 1
+                inserted_source += 1
             else:
-                updated += 1
-            upserted += 1
+                updated_source += 1
 
-        # update batch
+            # Create mapping row as 'pending' only for new source articles
+            cur.execute(
+                """INSERT INTO article_source_mapping
+                       (source_id, source_article_id, master_article_id, mapping_status, confidence)
+                   VALUES (%s,%s,NULL,'pending',0)
+                   ON CONFLICT (source_id, source_article_id) DO NOTHING""",
+                (source_id, source_article_id),
+            )
+            if cur.rowcount and cur.rowcount > 0:
+                new_mappings += 1
+
+        total = inserted_source + updated_source
+
         cur.execute(
             """UPDATE import_batches
                SET status = 'committed', finished_at = NOW(), rows_loaded_to_target = %s
                WHERE id = %s""",
-            (upserted, batch_id),
+            (total, batch_id),
         )
-        # mark staging rows committed
         cur.execute(
-            "UPDATE staging_articles SET validation_status = 'committed' WHERE batch_id = %s AND validation_status = 'valid'",
+            """UPDATE staging_articles SET validation_status = 'committed'
+               WHERE batch_id = %s AND validation_status = 'valid'""",
             (batch_id,),
         )
         conn.commit()
-        return {"upserted": upserted, "inserted": inserted, "updated": updated}
+        return {
+            "inserted": inserted_source,
+            "updated":  updated_source,
+            "new_mappings": new_mappings,
+        }
     except Exception:
         conn.rollback()
         raise
