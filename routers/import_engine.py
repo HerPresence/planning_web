@@ -248,6 +248,12 @@ def load_to_staging(
     field_mapping = get_field_mapping(source_id)
     if not field_mapping:
         field_mapping = DEFAULT_FIELDS_BY_TYPE.get(import_type_code) or []
+    elif import_type_code == "brands":
+        # Patch any new default fields missing from existing saved mappings
+        covered = {m["target_field"] for m in field_mapping}
+        missing = [df for df in BRANDS_DEFAULT_FIELDS if df["target_field"] not in covered]
+        if missing:
+            field_mapping = list(field_mapping) + missing
 
     batch_id = create_batch(
         source_id, import_type_code,
@@ -280,7 +286,8 @@ def load_to_staging(
                      finished_at=datetime.now())
         raise HTTPException(500, f"Error writing to staging: {exc}")
 
-    staging = universal_get_staging_preview(batch_id, import_type_code)
+    preview_limit = 5000 if import_type_code in ("departments", "brands") else 500
+    staging = universal_get_staging_preview(batch_id, import_type_code, limit=preview_limit)
     return {
         "batch_id": batch_id,
         "rows_total": len(raw_rows),

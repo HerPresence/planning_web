@@ -22,7 +22,7 @@ IMPORT_TYPES = [
     {"code": "pnl_fact",              "name": "Факт PnL",                      "target_table": "fact_pnl",            "staging_table": None},
     {"code": "sales_fact",            "name": "Факт продажів (товарооборот)",   "target_table": "fact_turnover",       "staging_table": "staging_sales_fact"},
     {"code": "departments",           "name": "Підрозділи",                     "target_table": "dim_department",      "staging_table": "staging_departments"},
-    {"code": "brands",                "name": "Бренди / Номенклатурні групи",   "target_table": "dim_brand",           "staging_table": "staging_brands"},
+    {"code": "brands",                "name": "Бренди / Номенклатурні групи",   "target_table": "dim_brand_source",    "staging_table": "staging_brands"},
     {"code": "sales_plan",            "name": "План товарообороту",             "target_table": "plan_turnover",       "staging_table": None},
     {"code": "expense_budget",        "name": "Бюджети витрат",                 "target_table": "budgets",             "staging_table": None},
     {"code": "articles",              "name": "Статті PnL",                     "target_table": "dim_article_source",  "staging_table": "staging_articles"},
@@ -53,6 +53,10 @@ BRANDS_DEFAULT_FIELDS = [
     {"source_field": "UIDОсновнаНоменклатурнаГрупаВитрат", "target_field": "parent_brand_uid",  "required": False},
     {"source_field": "ОсновнаНоменклатурнаГрупаВитрат",    "target_field": "parent_brand_name", "required": False},
     {"source_field": "Level1",                              "target_field": "brand_group",       "required": False},
+    {"source_field": "Level_1",                             "target_field": "source_level",      "required": False},
+    {"source_field": "Company",                             "target_field": "company_name",      "required": False},
+    {"source_field": "valid",                               "target_field": "is_active",         "required": False},
+    {"source_field": "brand_id",                            "target_field": "brand_id",          "required": False},
 ]
 
 ARTICLES_DEFAULT_FIELDS = [
@@ -100,6 +104,7 @@ CANONICAL_STAGING_FIELDS: dict[str, frozenset] = {
     "brands": frozenset({
         "brand_uid", "brand_name", "brand_group",
         "parent_brand_uid", "parent_brand_name",
+        "source_level", "company_name", "is_active", "brand_id",
     }),
     "articles": frozenset({
         "article_uid", "article_name", "article_type",
@@ -326,6 +331,15 @@ def ensure_import_engine_tables():
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_staging_brands_batch ON staging_brands (batch_id)"
         )
+        for _col, _typ in [
+            ("source_level", "TEXT"),
+            ("company_name",  "TEXT"),
+            ("is_active",     "TEXT"),
+            ("brand_id",      "TEXT"),
+        ]:
+            cur.execute(
+                f"ALTER TABLE staging_brands ADD COLUMN IF NOT EXISTS {_col} {_typ}"
+            )
 
         # staging_articles
         cur.execute("""
@@ -418,6 +432,72 @@ def ensure_import_engine_tables():
                 END IF;
             END $$
         """)
+
+        # ── Department source registry ─────────────────────────────────────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS dim_department_source (
+                id                               SERIAL PRIMARY KEY,
+                source_id                        INTEGER NOT NULL,
+                source_name                      TEXT    DEFAULT '',
+                source_department_id             TEXT    NOT NULL,
+                source_department_name           TEXT    DEFAULT '',
+                source_parent_department_id      TEXT    DEFAULT '',
+                source_parent_department_name    TEXT    DEFAULT '',
+                source_separated_department_id   TEXT    DEFAULT '',
+                source_separated_department_name TEXT    DEFAULT '',
+                organization_name                TEXT    DEFAULT '',
+                branch_name                      TEXT    DEFAULT '',
+                region_name                      TEXT    DEFAULT '',
+                holding_name                     TEXT    DEFAULT '',
+                extra_fields                     JSONB,
+                loaded_at                        TIMESTAMP DEFAULT NOW(),
+                is_active                        BOOLEAN   DEFAULT TRUE,
+                UNIQUE (source_id, source_department_id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS department_source_mapping (
+                id                   SERIAL PRIMARY KEY,
+                source_id            INTEGER NOT NULL,
+                source_department_id TEXT    NOT NULL,
+                master_department_id TEXT,
+                mapping_status       TEXT    DEFAULT 'pending',
+                confidence           NUMERIC(5,2) DEFAULT 0,
+                mapped_by            INTEGER,
+                created_at           TIMESTAMP DEFAULT NOW(),
+                updated_at           TIMESTAMP DEFAULT NOW(),
+                UNIQUE (source_id, source_department_id)
+            )
+        """)
+        for _idx_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_dds_source_id         ON dim_department_source(source_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dds_source_dept_id    ON dim_department_source(source_department_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dsm_source_id         ON department_source_mapping(source_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dsm_mapping_status    ON department_source_mapping(mapping_status)",
+            "CREATE INDEX IF NOT EXISTS idx_dsm_master_dept_id    ON department_source_mapping(master_department_id)",
+        ):
+            cur.execute(_idx_sql)
+
+        # Add change-tracking columns to dim_department_source (idempotent)
+        for _col_def in [
+            "source_changed   BOOLEAN DEFAULT FALSE",
+            "changed_fields   JSONB",
+            "previous_snapshot JSONB",
+            "last_batch_id    INTEGER",
+            "seen_count       INTEGER DEFAULT 1",
+            "last_seen_at     TIMESTAMP",
+        ]:
+            cur.execute(
+                f"ALTER TABLE dim_department_source ADD COLUMN IF NOT EXISTS {_col_def}"
+            )
+
+        # Add parent + is_deleted columns to dim_department
+        for _col, _typ in [
+            ("parent_department_id",   "TEXT"),
+            ("parent_department_name", "TEXT"),
+            ("is_deleted",             "BOOLEAN DEFAULT FALSE"),
+        ]:
+            cur.execute(f"ALTER TABLE dim_department ADD COLUMN IF NOT EXISTS {_col} {_typ}")
 
         # staging_table column on import_batches
         cur.execute(
@@ -1406,6 +1486,7 @@ def get_departments_staging_preview(batch_id: int, limit: int = 500,
             f"""SELECT id, department_uid, department_name, organization_name,
                        branch_name, region_name, holding_name,
                        parent_department_uid, parent_department_name,
+                       separated_department_uid, separated_department_name,
                        validation_status, validation_error, raw_row
                 FROM staging_departments
                 WHERE batch_id = %s{where_extra}
@@ -1422,17 +1503,19 @@ def get_departments_staging_preview(batch_id: int, limit: int = 500,
             "rows": [
                 {
                     "id": r[0],
-                    "department_uid":           r[1],
-                    "department_name":          r[2],
-                    "organization_name":        r[3],
-                    "branch_name":              r[4],
-                    "region_name":              r[5],
-                    "holding_name":             r[6],
-                    "parent_department_uid":    r[7],
-                    "parent_department_name":   r[8],
-                    "validation_status":        r[9],
-                    "validation_error":         r[10],
-                    "raw_row":                  r[11],
+                    "department_uid":             r[1],
+                    "department_name":            r[2],
+                    "organization_name":          r[3],
+                    "branch_name":                r[4],
+                    "region_name":                r[5],
+                    "holding_name":               r[6],
+                    "parent_department_uid":      r[7],
+                    "parent_department_name":     r[8],
+                    "separated_department_uid":   r[9],
+                    "separated_department_name":  r[10],
+                    "validation_status":          r[11],
+                    "validation_error":           r[12],
+                    "raw_row":                    r[13],
                 }
                 for r in rows_data
             ],
@@ -1442,53 +1525,196 @@ def get_departments_staging_preview(batch_id: int, limit: int = 500,
         conn.close()
 
 
+_TRACKED_SOURCE_FIELDS = [
+    "department_name", "parent_department_id", "parent_department_name",
+    "separated_department_id", "separated_department_name",
+    "organization_name", "branch_name", "region_name", "holding_name",
+]
+
+
 def commit_departments(batch_id: int) -> dict:
-    """Upsert valid staging_departments rows into dim_department."""
+    """Write valid staging_departments → dim_department_source + department_source_mapping.
+
+    Rules:
+    - dim_department_source: UPSERT descriptive fields; detect and record source changes.
+    - department_source_mapping: insert as 'pending' only for new source departments;
+      existing mapped/auto/rejected rows are preserved (ON CONFLICT DO NOTHING).
+    - Does NOT write to dim_department.
+    """
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute(
-            """SELECT department_uid, department_name, organization_name,
+            "SELECT import_source_id FROM import_batches WHERE id = %s",
+            (batch_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Batch {batch_id} not found")
+        source_id = row[0]
+
+        cur.execute("SELECT source_name FROM import_sources WHERE id = %s", (source_id,))
+        row = cur.fetchone()
+        source_name = row[0] if row else ""
+
+        # Pre-fetch all existing source records for this source_id (for change detection)
+        cur.execute(
+            """SELECT source_department_id,
+                      source_department_name, source_parent_department_id,
+                      source_parent_department_name, source_separated_department_id,
+                      source_separated_department_name, organization_name,
                       branch_name, region_name, holding_name
+               FROM dim_department_source
+               WHERE source_id = %s""",
+            (source_id,),
+        )
+        existing: dict = {r[0]: r[1:] for r in cur.fetchall()}
+
+        cur.execute(
+            """SELECT department_uid, department_name, organization_name,
+                      branch_name, region_name, holding_name,
+                      parent_department_uid, parent_department_name,
+                      separated_department_uid, separated_department_name,
+                      extra_fields
                FROM staging_departments
                WHERE batch_id = %s AND validation_status = 'valid' AND department_uid != ''""",
             (batch_id,),
         )
         staging_rows = cur.fetchall()
+        inserted = updated = new_mappings = changed_source_count = 0
 
-        upserted = inserted = updated = 0
         for r in staging_rows:
-            dept_uid, dept_name, org_name, branch, region, holding = r
+            (dept_uid, dept_name, org_name, branch, region, holding,
+             parent_uid, parent_name, sep_uid, sep_name, extra_fields) = r
 
-            cur.execute("SELECT 1 FROM dim_department WHERE department_id = %s", (dept_uid,))
-            exists = cur.fetchone()
-            if exists:
-                cur.execute(
-                    """UPDATE dim_department SET
-                       department_name    = %s,
-                       organization_name  = %s,
-                       branch_name        = %s,
-                       region_name        = %s,
-                       holding_name       = %s,
-                       is_active          = true,
-                       is_deleted         = false
-                       WHERE department_id = %s""",
-                    (dept_name, org_name, branch, region, holding, dept_uid),
-                )
-                updated += 1
-            else:
-                cur.execute(
-                    """INSERT INTO dim_department
-                       (department_id, department_name, organization_name,
-                        branch_name, region_name, holding_name, is_active)
-                       VALUES (%s, %s, %s, %s, %s, %s, true)""",
-                    (dept_uid, dept_name, org_name, branch, region, holding),
-                )
+            source_dept_id = (dept_uid or "").strip()
+            if not source_dept_id:
+                continue
+
+            extra_json = json.dumps(extra_fields, default=str) if extra_fields else None
+
+            # Detect changes vs existing record
+            old_rec = existing.get(source_dept_id)
+            is_changed = False
+            changed_fields_list: list = []
+            prev_snap: dict = {}
+
+            if old_rec is not None:
+                old_name, old_pid, old_pname, old_sid, old_sname, old_org, old_branch, old_region, old_holding = old_rec
+                new_vals = {
+                    "department_name":           (dept_name   or ""),
+                    "parent_department_id":      (parent_uid  or ""),
+                    "parent_department_name":    (parent_name or ""),
+                    "separated_department_id":   (sep_uid     or ""),
+                    "separated_department_name": (sep_name    or ""),
+                    "organization_name":         (org_name    or ""),
+                    "branch_name":               (branch      or ""),
+                    "region_name":               (region      or ""),
+                    "holding_name":              (holding     or ""),
+                }
+                old_vals = {
+                    "department_name":           (old_name    or ""),
+                    "parent_department_id":      (old_pid     or ""),
+                    "parent_department_name":    (old_pname   or ""),
+                    "separated_department_id":   (old_sid     or ""),
+                    "separated_department_name": (old_sname   or ""),
+                    "organization_name":         (old_org     or ""),
+                    "branch_name":               (old_branch  or ""),
+                    "region_name":               (old_region  or ""),
+                    "holding_name":              (old_holding or ""),
+                }
+                for field in _TRACKED_SOURCE_FIELDS:
+                    if old_vals[field] != new_vals[field]:
+                        changed_fields_list.append(field)
+                        prev_snap[field] = old_vals[field]
+                is_changed = bool(changed_fields_list)
+
+            changed_fields_json = json.dumps(changed_fields_list, ensure_ascii=False) if changed_fields_list else None
+            prev_snap_json      = json.dumps(prev_snap,           ensure_ascii=False) if prev_snap          else None
+
+            cur.execute(
+                """INSERT INTO dim_department_source
+                       (source_id, source_name, source_department_id, source_department_name,
+                        source_parent_department_id, source_parent_department_name,
+                        source_separated_department_id, source_separated_department_name,
+                        organization_name, branch_name, region_name, holding_name,
+                        extra_fields, loaded_at, is_active,
+                        last_batch_id, seen_count, source_changed,
+                        changed_fields, previous_snapshot, last_seen_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           %s::jsonb, NOW(), TRUE,
+                           %s, 1, FALSE, NULL, NULL, NOW())
+                   ON CONFLICT (source_id, source_department_id) DO UPDATE SET
+                       source_name                      = EXCLUDED.source_name,
+                       source_department_name           = EXCLUDED.source_department_name,
+                       source_parent_department_id      = EXCLUDED.source_parent_department_id,
+                       source_parent_department_name    = EXCLUDED.source_parent_department_name,
+                       source_separated_department_id   = EXCLUDED.source_separated_department_id,
+                       source_separated_department_name = EXCLUDED.source_separated_department_name,
+                       organization_name                = EXCLUDED.organization_name,
+                       branch_name                      = EXCLUDED.branch_name,
+                       region_name                      = EXCLUDED.region_name,
+                       holding_name                     = EXCLUDED.holding_name,
+                       extra_fields                     = EXCLUDED.extra_fields,
+                       loaded_at                        = NOW(),
+                       is_active                        = TRUE,
+                       last_batch_id                    = %s,
+                       seen_count                       = COALESCE(dim_department_source.seen_count, 0) + 1,
+                       source_changed                   = %s,
+                       changed_fields                   = CASE WHEN %s
+                                                               THEN %s::jsonb
+                                                               ELSE dim_department_source.changed_fields END,
+                       previous_snapshot                = CASE WHEN %s
+                                                               THEN %s::jsonb
+                                                               ELSE dim_department_source.previous_snapshot END,
+                       last_seen_at                     = NOW()
+                   RETURNING (xmax = 0) AS is_insert""",
+                (
+                    # INSERT values
+                    source_id, source_name, source_dept_id,
+                    dept_name or "", parent_uid or "", parent_name or "",
+                    sep_uid or "", sep_name or "",
+                    org_name or "", branch or "", region or "", holding or "",
+                    extra_json, batch_id,
+                    # ON CONFLICT UPDATE values
+                    batch_id,
+                    is_changed,
+                    is_changed, changed_fields_json,
+                    is_changed, prev_snap_json,
+                ),
+            )
+            upsert_row = cur.fetchone()
+            if upsert_row and upsert_row[0]:
                 inserted += 1
-            upserted += 1
+            else:
+                updated += 1
+                if is_changed:
+                    changed_source_count += 1
+
+            cur.execute(
+                """INSERT INTO department_source_mapping
+                       (source_id, source_department_id, master_department_id, mapping_status, confidence)
+                   VALUES (%s, %s, NULL, 'pending', 0)
+                   ON CONFLICT (source_id, source_department_id) DO NOTHING""",
+                (source_id, source_dept_id),
+            )
+            if cur.rowcount > 0:
+                new_mappings += 1
+
+        cur.execute(
+            """UPDATE import_batches
+               SET status = 'committed', finished_at = NOW(), rows_loaded_to_target = %s
+               WHERE id = %s""",
+            (inserted + updated, batch_id),
+        )
 
         conn.commit()
-        return {"upserted": upserted, "inserted": inserted, "updated": updated}
+        return {
+            "inserted":            inserted,
+            "updated":             updated,
+            "new_mappings":        new_mappings,
+            "changed_source_count": changed_source_count,
+        }
     except Exception:
         conn.rollback()
         raise
@@ -1517,11 +1743,15 @@ def load_brands_to_staging(batch_id: int, rows: list, field_mapping: list) -> tu
             mapped, _ = _apply_mapping(row, field_mapping)
             _, extra = _split_canonical_extra(mapped, CANONICAL_STAGING_FIELDS["brands"])
 
-            brand_uid   = str(mapped.get("brand_uid")   or "").strip()
-            brand_name  = str(mapped.get("brand_name")  or "").strip()
-            brand_group = str(mapped.get("brand_group") or "").strip()
-            p_uid  = str(mapped.get("parent_brand_uid")  or "").strip()
-            p_name = str(mapped.get("parent_brand_name") or "").strip()
+            brand_uid    = str(mapped.get("brand_uid")    or "").strip()
+            brand_name   = str(mapped.get("brand_name")   or "").strip()
+            brand_group  = str(mapped.get("brand_group")  or "").strip()
+            p_uid        = str(mapped.get("parent_brand_uid")  or "").strip()
+            p_name       = str(mapped.get("parent_brand_name") or "").strip()
+            source_level = str(mapped.get("source_level") or "").strip()
+            company_name = str(mapped.get("company_name") or "").strip()
+            is_active    = str(mapped.get("is_active")    or "").strip()
+            brand_id     = str(mapped.get("brand_id")     or "").strip()
 
             errors = []
             if not brand_name:
@@ -1546,10 +1776,13 @@ def load_brands_to_staging(batch_id: int, rows: list, field_mapping: list) -> tu
                        (batch_id, import_type_code,
                         brand_uid, brand_name, brand_group,
                         parent_brand_uid, parent_brand_name,
+                        source_level, company_name, is_active, brand_id,
                         raw_row, extra_fields, validation_status, validation_error)
-                       VALUES (%s,'brands',%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)""",
+                       VALUES (%s,'brands',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)""",
                     (batch_id, brand_uid or None, brand_name, brand_group or None,
-                     p_uid or None, p_name or None, raw_json, extra_json, v_status, v_error),
+                     p_uid or None, p_name or None,
+                     source_level or None, company_name or None, is_active or None, brand_id or None,
+                     raw_json, extra_json, v_status, v_error),
                 )
                 rows_loaded += 1
             except Exception as exc:
@@ -1591,6 +1824,7 @@ def get_brands_staging_preview(batch_id: int, limit: int = 500,
         cur.execute(
             f"""SELECT id, brand_uid, brand_name, brand_group,
                        parent_brand_uid, parent_brand_name,
+                       source_level, company_name, is_active, brand_id,
                        validation_status, validation_error, raw_row
                 FROM staging_brands
                 WHERE batch_id = %s{where_extra}
@@ -1606,15 +1840,19 @@ def get_brands_staging_preview(batch_id: int, limit: int = 500,
             "invalid": agg[2] or 0,
             "rows": [
                 {
-                    "id": r[0],
+                    "id":                r[0],
                     "brand_uid":         r[1],
                     "brand_name":        r[2],
                     "brand_group":       r[3],
                     "parent_brand_uid":  r[4],
                     "parent_brand_name": r[5],
-                    "validation_status": r[6],
-                    "validation_error":  r[7],
-                    "raw_row":           r[8],
+                    "source_level":      r[6],
+                    "company_name":      r[7],
+                    "is_active":         r[8],
+                    "brand_id":          r[9],
+                    "validation_status": r[10],
+                    "validation_error":  r[11],
+                    "raw_row":           r[12],
                 }
                 for r in rows_data
             ],
@@ -1625,67 +1863,191 @@ def get_brands_staging_preview(batch_id: int, limit: int = 500,
 
 
 def commit_brands(batch_id: int) -> dict:
-    """Upsert valid staging_brands rows into dim_brand."""
+    """Write valid staging_brands → dim_brand_source + brand_source_mapping (Phase 1).
+
+    Rules:
+    - dim_brand_source: upsert descriptive fields; never resets mapping state.
+    - brand_source_mapping: insert as 'pending' only for new source brands;
+      existing mapped/rejected rows are never touched (ON CONFLICT DO NOTHING).
+    - Does NOT write to dim_brand.
+    """
     conn = get_connection()
     cur = conn.cursor()
     try:
+        # Resolve source_id and source_name from batch
         cur.execute(
-            """SELECT brand_uid, brand_name, brand_group, parent_brand_uid, parent_brand_name
+            "SELECT import_source_id FROM import_batches WHERE id = %s",
+            (batch_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Batch {batch_id} not found")
+        source_id = row[0]
+
+        cur.execute("SELECT source_name FROM import_sources WHERE id = %s", (source_id,))
+        row = cur.fetchone()
+        source_name = row[0] if row else ""
+
+        # Ensure columns exist in dim_brand_source
+        for ddl in [
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS last_batch_id INTEGER",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS seen_count INTEGER DEFAULT 1",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_changed BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS changed_fields JSONB DEFAULT '[]'::JSONB",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS previous_snapshot JSONB",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_level TEXT",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_company_name TEXT",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_is_active TEXT",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_brand_ref_id TEXT",
+        ]:
+            cur.execute(ddl)
+
+        # Fetch valid staging rows
+        cur.execute(
+            """SELECT brand_uid, brand_name, brand_group,
+                      parent_brand_uid, parent_brand_name,
+                      extra_fields,
+                      source_level, company_name, is_active, brand_id
                FROM staging_brands
                WHERE batch_id = %s AND validation_status = 'valid' AND brand_name != ''""",
             (batch_id,),
         )
         staging_rows = cur.fetchall()
 
-        upserted = inserted = updated = 0
-        for r in staging_rows:
-            brand_uid, brand_name, brand_group, p_uid, p_name = r
+        # Pre-fetch existing records for change detection
+        cur.execute(
+            """SELECT source_brand_id, source_brand_name, source_brand_group,
+                      source_parent_uid, source_parent_name,
+                      source_level, source_company_name, source_is_active
+               FROM dim_brand_source WHERE source_id = %s""",
+            (source_id,),
+        )
+        existing = {r[0]: r[1:] for r in cur.fetchall()}
 
-            if brand_uid:
-                cur.execute(
-                    """INSERT INTO dim_brand
-                       (brand_uid, brand_name, brand_group, parent_brand_uid, parent_brand_name, is_active)
-                       VALUES (%s, %s, %s, %s, %s, true)
-                       ON CONFLICT (brand_uid) DO UPDATE SET
-                         brand_name        = EXCLUDED.brand_name,
-                         brand_group       = EXCLUDED.brand_group,
-                         parent_brand_uid  = EXCLUDED.parent_brand_uid,
-                         parent_brand_name = EXCLUDED.parent_brand_name,
-                         is_active         = true,
-                         updated_at        = NOW()
-                       RETURNING (xmax = 0) AS is_insert""",
-                    (brand_uid, brand_name, brand_group or None, p_uid or None, p_name or None),
-                )
-                row = cur.fetchone()
-                if row and row[0]:
-                    inserted += 1
-                else:
-                    updated += 1
+        _TRACKED = (
+            "source_brand_name", "source_brand_group",
+            "source_parent_uid", "source_parent_name",
+            "source_level", "source_company_name", "source_is_active",
+        )
+        inserted = updated = new_mappings = 0
+
+        for (brand_uid, brand_name, brand_group, p_uid, p_name,
+             extra_fields, source_level, company_name, is_active, brand_id) in staging_rows:
+            # Stable source_brand_id: prefer brand_uid, fall back to brand_name
+            source_brand_id = (brand_uid or "").strip() or (brand_name or "").strip()
+            if not source_brand_id:
+                continue
+
+            extra_json = json.dumps(extra_fields, default=str) if extra_fields else None
+            new_vals = (
+                brand_name or "", brand_group or "", p_uid or "", p_name or "",
+                source_level or "", company_name or "", is_active or "",
+            )
+
+            # Source-changed detection
+            existing_rec = existing.get(source_brand_id)
+            if existing_rec is None:
+                src_changed = False
+                changed_fields_list = []
+                prev_snapshot = None
             else:
-                cur.execute(
-                    "SELECT id FROM dim_brand WHERE LOWER(TRIM(brand_name)) = LOWER(TRIM(%s)) AND COALESCE(is_deleted, false) = false LIMIT 1",
-                    (brand_name,),
-                )
-                existing = cur.fetchone()
-                if existing:
-                    cur.execute(
-                        """UPDATE dim_brand SET brand_group = %s, parent_brand_uid = %s,
-                           parent_brand_name = %s, is_active = true, updated_at = NOW()
-                           WHERE id = %s""",
-                        (brand_group or None, p_uid or None, p_name or None, existing[0]),
-                    )
-                    updated += 1
-                else:
-                    cur.execute(
-                        """INSERT INTO dim_brand (brand_name, brand_group, parent_brand_uid, parent_brand_name, is_active)
-                           VALUES (%s, %s, %s, %s, true)""",
-                        (brand_name, brand_group or None, p_uid or None, p_name or None),
-                    )
-                    inserted += 1
-            upserted += 1
+                changed = [
+                    fname for i, fname in enumerate(_TRACKED)
+                    if str(existing_rec[i] or "") != str(new_vals[i] or "")
+                ]
+                src_changed = bool(changed)
+                changed_fields_list = changed
+                prev_snapshot = {
+                    "source_brand_name":  existing_rec[0],
+                    "source_brand_group": existing_rec[1],
+                    "source_parent_uid":  existing_rec[2],
+                    "source_parent_name": existing_rec[3],
+                    "source_level":       existing_rec[4],
+                    "source_company_name":existing_rec[5],
+                    "source_is_active":   existing_rec[6],
+                } if src_changed else None
 
+            changed_fields_json = json.dumps(changed_fields_list)
+            prev_snapshot_json = json.dumps(prev_snapshot, default=str) if prev_snapshot else None
+
+            # Upsert descriptive fields — never overwrites mapping state
+            cur.execute(
+                """INSERT INTO dim_brand_source
+                       (source_id, source_name, source_brand_id, source_brand_name,
+                        source_brand_group, source_parent_uid, source_parent_name,
+                        extra_fields, loaded_at, is_active,
+                        source_level, source_company_name, source_is_active, source_brand_ref_id,
+                        last_batch_id, last_seen_at, seen_count,
+                        source_changed, changed_fields, previous_snapshot, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), TRUE,
+                           %s, %s, %s, %s,
+                           %s, NOW(), 1,
+                           %s, %s::jsonb, %s::jsonb, NOW())
+                   ON CONFLICT (source_id, source_brand_id) DO UPDATE SET
+                       source_name         = EXCLUDED.source_name,
+                       source_brand_name   = EXCLUDED.source_brand_name,
+                       source_brand_group  = EXCLUDED.source_brand_group,
+                       source_parent_uid   = EXCLUDED.source_parent_uid,
+                       source_parent_name  = EXCLUDED.source_parent_name,
+                       extra_fields        = EXCLUDED.extra_fields,
+                       loaded_at           = NOW(),
+                       is_active           = TRUE,
+                       source_level        = EXCLUDED.source_level,
+                       source_company_name = EXCLUDED.source_company_name,
+                       source_is_active    = EXCLUDED.source_is_active,
+                       source_brand_ref_id = EXCLUDED.source_brand_ref_id,
+                       last_batch_id       = EXCLUDED.last_batch_id,
+                       last_seen_at        = NOW(),
+                       seen_count          = COALESCE(dim_brand_source.seen_count, 0) + 1,
+                       source_changed      = EXCLUDED.source_changed,
+                       changed_fields      = EXCLUDED.changed_fields,
+                       previous_snapshot   = CASE WHEN EXCLUDED.source_changed
+                                                  THEN EXCLUDED.previous_snapshot
+                                                  ELSE dim_brand_source.previous_snapshot END,
+                       updated_at          = NOW()
+                   RETURNING (xmax = 0) AS is_insert""",
+                (source_id, source_name, source_brand_id,
+                 brand_name or "", brand_group or "",
+                 p_uid or "", p_name or "",
+                 extra_json,
+                 source_level or None, company_name or None, is_active or None, brand_id or None,
+                 batch_id,
+                 src_changed, changed_fields_json, prev_snapshot_json),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                inserted += 1
+            else:
+                updated += 1
+
+            # New pending mapping only — never overwrites mapped/rejected
+            cur.execute(
+                """INSERT INTO brand_source_mapping
+                       (source_id, source_brand_id, master_brand_id, mapping_status, confidence)
+                   VALUES (%s, %s, NULL, 'pending', 0)
+                   ON CONFLICT (source_id, source_brand_id) DO NOTHING""",
+                (source_id, source_brand_id),
+            )
+            if cur.rowcount and cur.rowcount > 0:
+                new_mappings += 1
+
+        total = inserted + updated
+
+        cur.execute(
+            """UPDATE import_batches
+               SET status = 'committed', finished_at = NOW(), rows_loaded_to_target = %s
+               WHERE id = %s""",
+            (total, batch_id),
+        )
+        cur.execute(
+            """UPDATE staging_brands SET validation_status = 'committed'
+               WHERE batch_id = %s AND validation_status = 'valid'""",
+            (batch_id,),
+        )
         conn.commit()
-        return {"upserted": upserted, "inserted": inserted, "updated": updated}
+        return {"inserted": inserted, "updated": updated, "new_mappings": new_mappings}
     except Exception:
         conn.rollback()
         raise

@@ -29,8 +29,9 @@ MENU_ITEMS_SEED = [
     ("cashflow",      "БДДС",             "planning",    "cashflow",      13),
     ("pnlData",       "План / Факт PnL",  "planning",    "pnlData",       14),
     ("pnlImport",     "Імпорт PnL",       "planning",    "pnlImport",     15),
-    ("factTurnover",  "Факт продажів",    "planning",    "factTurnover",  16),
-    ("budgets",       "Бюджети витрат",   "planning",    "budgets",       17),
+    ("importData",    "Імпорт даних",     "planning",    "importData",    16),
+    ("factTurnover",  "Факт продажів",    "planning",    "factTurnover",  17),
+    ("budgets",       "Бюджети витрат",   "planning",    "budgets",       18),
     ("users",         "Користувачі",      "admin",       "users",         17),
     ("roles",         "Ролі",             "admin",       "roles",         18),
     ("permissions",   "Права доступу",    "admin",       "permissions",   19),
@@ -95,10 +96,10 @@ def ensure_admin_tables() -> None:
         default_templates = [
             ("CFO Full",         "Повний доступ до планування та звітності",
              [{"menu_key": k, "can_view": True, "can_edit": True}
-              for k in ["home","pnlData","pnlImport","cashflow","budgets","articles","departments","holdings","organizations","regions","branches","sources","pnlStructure","importSources","masterL1","masterL2"]]),
+              for k in ["home","pnlData","pnlImport","cashflow","budgets","articles","departments","holdings","organizations","regions","branches","sources","pnlStructure","importSources","importData","masterL1","masterL2"]]),
             ("Controller",       "Перегляд всіх даних, редагування плану",
              [{"menu_key": k, "can_view": True, "can_edit": k in ["pnlData","pnlImport"]}
-              for k in ["home","pnlData","pnlImport","cashflow","budgets","articles","departments","holdings","organizations","regions","branches","sources","pnlStructure","importSources","masterL1","masterL2"]]),
+              for k in ["home","pnlData","pnlImport","cashflow","budgets","articles","departments","holdings","organizations","regions","branches","sources","pnlStructure","importSources","importData","masterL1","masterL2"]]),
             ("Read Only",        "Тільки перегляд даних",
              [{"menu_key": k, "can_view": True, "can_edit": False}
               for k in ["home","pnlData","cashflow","budgets","articles","departments","holdings","organizations","regions","branches","sources","pnlStructure","masterL1","masterL2"]]),
@@ -187,6 +188,13 @@ def ensure_admin_tables() -> None:
         cur.execute(
             "UPDATE menu_items SET sort_order = 17 WHERE menu_key = 'budgets' AND sort_order = 16"
         )
+        # Shift factTurnover and budgets to make room for importData at sort_order 16
+        cur.execute(
+            "UPDATE menu_items SET sort_order = 17 WHERE menu_key = 'factTurnover' AND sort_order = 16"
+        )
+        cur.execute(
+            "UPDATE menu_items SET sort_order = 18 WHERE menu_key = 'budgets' AND sort_order = 17"
+        )
 
         # Seed Admin role
         cur.execute("""
@@ -221,6 +229,22 @@ def ensure_admin_tables() -> None:
                 cur.execute("""
                     INSERT INTO role_permissions (role_id, menu_key, can_view, can_edit, can_create)
                     VALUES (%s, 'factTurnover', %s, %s, %s)
+                    ON CONFLICT (role_id, menu_key) DO NOTHING
+                """, (rrow[0], can_view, can_edit, can_create))
+
+        # Seed importData permissions for standard non-admin roles (if those roles exist)
+        # DO NOTHING — never overwrite manually-set permissions
+        _import_data_role_perms = [
+            ("CFO",                  True,  True,  True),
+            ("Business Controller",  True,  False, False),
+        ]
+        for role_name, can_view, can_edit, can_create in _import_data_role_perms:
+            cur.execute("SELECT id FROM roles WHERE role_name = %s", (role_name,))
+            rrow = cur.fetchone()
+            if rrow:
+                cur.execute("""
+                    INSERT INTO role_permissions (role_id, menu_key, can_view, can_edit, can_create)
+                    VALUES (%s, 'importData', %s, %s, %s)
                     ON CONFLICT (role_id, menu_key) DO NOTHING
                 """, (rrow[0], can_view, can_edit, can_create))
 

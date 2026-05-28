@@ -34,6 +34,8 @@ from routers.auth_router import router as auth_router
 from routers.import_engine import router as import_engine_router
 from services.import_engine import ensure_import_engine_tables
 from routers.brands import router as brands_router, ensure_brand_table
+from routers.brand_source_mapping import router as brand_source_mapping_router
+from routers.department_source_mapping import router as department_source_mapping_router
 from services.article_import_service import (
     ensure_source_staging_tables,
     migrate_legacy_article_mappings,
@@ -110,6 +112,8 @@ app.include_router(admin_access_router)
 app.include_router(auth_router)
 app.include_router(import_engine_router)
 app.include_router(brands_router)
+app.include_router(brand_source_mapping_router)
+app.include_router(department_source_mapping_router)
 
 
 FRONT_BUILD_DIR = r"T:\planning_front\build"

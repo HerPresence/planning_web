@@ -38,6 +38,8 @@ _PATH_TO_MENU: list[tuple[str, str]] = [
     ("/api/pnl-structure",                "pnlStructure"),
     ("/api/pnl-import",                   "pnlImport"),
     ("/api/pnl",                          "pnlData"),
+    ("/api/brand-source-mapping",          "importSources"),
+    ("/api/department-source-mapping",    "importSources"),
     ("/api/article-source-mapping",       "importSources"),
     ("/api/import-sources",               "importSources"),
     ("/api/import-articles",              "pnlImport"),
