@@ -54,9 +54,9 @@ BRANDS_DEFAULT_FIELDS = [
     {"source_field": "ОсновнаНоменклатурнаГрупаВитрат",    "target_field": "parent_brand_name", "required": False},
     {"source_field": "Level1",                              "target_field": "brand_group",       "required": False},
     {"source_field": "Level_1",                             "target_field": "source_level",      "required": False},
-    {"source_field": "Company",                             "target_field": "company_name",      "required": False},
-    {"source_field": "valid",                               "target_field": "is_active",         "required": False},
-    {"source_field": "brand_id",                            "target_field": "brand_id",          "required": False},
+    {"source_field": "Company",                             "target_field": "source_company_name", "required": False},
+    {"source_field": "valid",                               "target_field": "source_is_active",    "required": False},
+    {"source_field": "brand_id",                            "target_field": "source_brand_ref_id", "required": False},
 ]
 
 ARTICLES_DEFAULT_FIELDS = [
@@ -104,7 +104,9 @@ CANONICAL_STAGING_FIELDS: dict[str, frozenset] = {
     "brands": frozenset({
         "brand_uid", "brand_name", "brand_group",
         "parent_brand_uid", "parent_brand_name",
-        "source_level", "company_name", "is_active", "brand_id",
+        "source_level", "source_company_name", "source_is_active", "source_brand_ref_id",
+        # accepted aliases — so user-typed targets don't get extra_fields yellow label
+        "Level_1", "Company", "valid", "brand_id", "company_name", "is_active",
     }),
     "articles": frozenset({
         "article_uid", "article_name", "article_type",
@@ -332,10 +334,10 @@ def ensure_import_engine_tables():
             "CREATE INDEX IF NOT EXISTS idx_staging_brands_batch ON staging_brands (batch_id)"
         )
         for _col, _typ in [
-            ("source_level", "TEXT"),
-            ("company_name",  "TEXT"),
-            ("is_active",     "TEXT"),
-            ("brand_id",      "TEXT"),
+            ("source_level",        "TEXT"),
+            ("source_company_name", "TEXT"),
+            ("source_is_active",    "TEXT"),
+            ("source_brand_ref_id", "TEXT"),
         ]:
             cur.execute(
                 f"ALTER TABLE staging_brands ADD COLUMN IF NOT EXISTS {_col} {_typ}"
@@ -1748,10 +1750,13 @@ def load_brands_to_staging(batch_id: int, rows: list, field_mapping: list) -> tu
             brand_group  = str(mapped.get("brand_group")  or "").strip()
             p_uid        = str(mapped.get("parent_brand_uid")  or "").strip()
             p_name       = str(mapped.get("parent_brand_name") or "").strip()
-            source_level = str(mapped.get("source_level") or "").strip()
-            company_name = str(mapped.get("company_name") or "").strip()
-            is_active    = str(mapped.get("is_active")    or "").strip()
-            brand_id     = str(mapped.get("brand_id")     or "").strip()
+            source_level        = str(mapped.get("source_level")        or mapped.get("Level_1")   or "").strip()
+            source_company_name = str(mapped.get("source_company_name") or mapped.get("Company")   or mapped.get("company_name") or "").strip()
+            source_is_active    = str(mapped.get("source_is_active")    or mapped.get("valid")     or mapped.get("is_active")    or "").strip()
+            source_brand_ref_id = str(mapped.get("source_brand_ref_id") or mapped.get("brand_id") or "").strip()
+            if i < 3:
+                print(f"[brands debug] row#{i}: raw_keys={list(row.keys())[:8]}")
+                print(f"[brands debug] row#{i}: source_level={source_level!r} source_company_name={source_company_name!r} source_is_active={source_is_active!r} source_brand_ref_id={source_brand_ref_id!r}")
 
             errors = []
             if not brand_name:
@@ -1776,12 +1781,12 @@ def load_brands_to_staging(batch_id: int, rows: list, field_mapping: list) -> tu
                        (batch_id, import_type_code,
                         brand_uid, brand_name, brand_group,
                         parent_brand_uid, parent_brand_name,
-                        source_level, company_name, is_active, brand_id,
+                        source_level, source_company_name, source_is_active, source_brand_ref_id,
                         raw_row, extra_fields, validation_status, validation_error)
                        VALUES (%s,'brands',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)""",
                     (batch_id, brand_uid or None, brand_name, brand_group or None,
                      p_uid or None, p_name or None,
-                     source_level or None, company_name or None, is_active or None, brand_id or None,
+                     source_level or None, source_company_name or None, source_is_active or None, source_brand_ref_id or None,
                      raw_json, extra_json, v_status, v_error),
                 )
                 rows_loaded += 1
@@ -1824,7 +1829,7 @@ def get_brands_staging_preview(batch_id: int, limit: int = 500,
         cur.execute(
             f"""SELECT id, brand_uid, brand_name, brand_group,
                        parent_brand_uid, parent_brand_name,
-                       source_level, company_name, is_active, brand_id,
+                       source_level, source_company_name, source_is_active, source_brand_ref_id,
                        validation_status, validation_error, raw_row
                 FROM staging_brands
                 WHERE batch_id = %s{where_extra}
@@ -1846,10 +1851,10 @@ def get_brands_staging_preview(batch_id: int, limit: int = 500,
                     "brand_group":       r[3],
                     "parent_brand_uid":  r[4],
                     "parent_brand_name": r[5],
-                    "source_level":      r[6],
-                    "company_name":      r[7],
-                    "is_active":         r[8],
-                    "brand_id":          r[9],
+                    "source_level":          r[6],
+                    "source_company_name":   r[7],
+                    "source_is_active":      r[8],
+                    "source_brand_ref_id":   r[9],
                     "validation_status": r[10],
                     "validation_error":  r[11],
                     "raw_row":           r[12],
@@ -1901,6 +1906,10 @@ def commit_brands(batch_id: int) -> dict:
             "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_company_name TEXT",
             "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_is_active TEXT",
             "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_brand_ref_id TEXT",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS archived_by INTEGER",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS archive_reason TEXT",
         ]:
             cur.execute(ddl)
 
@@ -1909,7 +1918,7 @@ def commit_brands(batch_id: int) -> dict:
             """SELECT brand_uid, brand_name, brand_group,
                       parent_brand_uid, parent_brand_name,
                       extra_fields,
-                      source_level, company_name, is_active, brand_id
+                      source_level, source_company_name, source_is_active, source_brand_ref_id
                FROM staging_brands
                WHERE batch_id = %s AND validation_status = 'valid' AND brand_name != ''""",
             (batch_id,),
@@ -1934,7 +1943,7 @@ def commit_brands(batch_id: int) -> dict:
         inserted = updated = new_mappings = 0
 
         for (brand_uid, brand_name, brand_group, p_uid, p_name,
-             extra_fields, source_level, company_name, is_active, brand_id) in staging_rows:
+             extra_fields, source_level, source_company_name, source_is_active, source_brand_ref_id) in staging_rows:
             # Stable source_brand_id: prefer brand_uid, fall back to brand_name
             source_brand_id = (brand_uid or "").strip() or (brand_name or "").strip()
             if not source_brand_id:
@@ -1943,7 +1952,7 @@ def commit_brands(batch_id: int) -> dict:
             extra_json = json.dumps(extra_fields, default=str) if extra_fields else None
             new_vals = (
                 brand_name or "", brand_group or "", p_uid or "", p_name or "",
-                source_level or "", company_name or "", is_active or "",
+                source_level or "", source_company_name or "", source_is_active or "",
             )
 
             # Source-changed detection
@@ -1994,6 +2003,7 @@ def commit_brands(batch_id: int) -> dict:
                        extra_fields        = EXCLUDED.extra_fields,
                        loaded_at           = NOW(),
                        is_active           = TRUE,
+                       archived            = FALSE,
                        source_level        = EXCLUDED.source_level,
                        source_company_name = EXCLUDED.source_company_name,
                        source_is_active    = EXCLUDED.source_is_active,
@@ -2012,7 +2022,7 @@ def commit_brands(batch_id: int) -> dict:
                  brand_name or "", brand_group or "",
                  p_uid or "", p_name or "",
                  extra_json,
-                 source_level or None, company_name or None, is_active or None, brand_id or None,
+                 source_level or None, source_company_name or None, source_is_active or None, source_brand_ref_id or None,
                  batch_id,
                  src_changed, changed_fields_json, prev_snapshot_json),
             )
@@ -2035,6 +2045,19 @@ def commit_brands(batch_id: int) -> dict:
 
         total = inserted + updated
 
+        # Soft-delete brands absent from current batch
+        cur.execute(
+            """UPDATE dim_brand_source
+               SET is_active = FALSE, updated_at = NOW()
+               WHERE source_id = %(source_id)s
+                 AND is_active = TRUE
+                 AND source_brand_id NOT IN (
+                     SELECT source_brand_id FROM staging_brands WHERE batch_id = %(batch_id)s
+                 )""",
+            {"source_id": source_id, "batch_id": batch_id},
+        )
+        deactivated = cur.rowcount or 0
+
         cur.execute(
             """UPDATE import_batches
                SET status = 'committed', finished_at = NOW(), rows_loaded_to_target = %s
@@ -2046,8 +2069,19 @@ def commit_brands(batch_id: int) -> dict:
                WHERE batch_id = %s AND validation_status = 'valid'""",
             (batch_id,),
         )
+
+        # Staging cleanup: delete batches older than 30 days
+        cur.execute(
+            "DELETE FROM staging_brands WHERE created_at < NOW() - INTERVAL '30 days'"
+        )
+
         conn.commit()
-        return {"inserted": inserted, "updated": updated, "new_mappings": new_mappings}
+        return {
+            "inserted":    inserted,
+            "updated":     updated,
+            "new_mappings": new_mappings,
+            "deactivated": deactivated,
+        }
     except Exception:
         conn.rollback()
         raise

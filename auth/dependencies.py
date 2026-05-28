@@ -85,3 +85,27 @@ def require_permission(menu_key: str, action: str = "view"):
             conn.close()
 
     return _dep
+
+
+def require_superadmin(credentials: HTTPAuthorizationCredentials = Depends(bearer)) -> dict:
+    """Requires is_admin=True AND role 'SuperAdmin' assigned to the user."""
+    user = _parse(credentials)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not user["is_admin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT 1 FROM user_roles ur
+               JOIN roles r ON r.id = ur.role_id
+               WHERE ur.user_id = %s AND r.role_name = 'SuperAdmin' AND r.is_active = TRUE""",
+            (user["id"],),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=403, detail="SuperAdmin role required")
+    finally:
+        cur.close()
+        conn.close()
+    return user

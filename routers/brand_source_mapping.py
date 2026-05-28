@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.dependencies import get_current_user
+from auth.dependencies import get_current_user, require_admin, require_superadmin
 from db import get_connection
 
 router = APIRouter(prefix="/api/brand-source-mapping")
@@ -149,9 +149,17 @@ def _ensure_brand_columns():
             "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_company_name TEXT",
             "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_is_active TEXT",
             "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS source_brand_ref_id TEXT",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS archived_by INTEGER",
+            "ALTER TABLE dim_brand_source ADD COLUMN IF NOT EXISTS archive_reason TEXT",
             "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS parent_brand_uid TEXT",
             "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS parent_brand_name TEXT",
             "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS source_level TEXT",
+            "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS source_company_name TEXT",
+            "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS source_is_active TEXT",
+            "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS source_brand_ref_id TEXT",
         ]:
             cur.execute(ddl)
         conn.commit()
@@ -263,6 +271,9 @@ def _row_to_staged(r) -> dict:
         "source_company_name":   r[28] if len(r) > 28 else None,
         "source_is_active":      r[29] if len(r) > 29 else None,
         "source_brand_ref_id":   r[30] if len(r) > 30 else None,
+        "archived":              bool(r[31]) if len(r) > 31 and r[31] is not None else False,
+        "archived_at":           str(r[32]) if len(r) > 32 and r[32] else None,
+        "archive_reason":        r[33] if len(r) > 33 else None,
     }
 
 
@@ -281,17 +292,29 @@ def get_staged(
     company:            Optional[str] = None,
     source_level:       Optional[str] = None,
     source_is_active:   Optional[str] = None,
+    visibility:         str = "active",
     page:               int = 1,
     page_size:          int = 100,
     _u=Depends(get_current_user),
 ):
-    """Return source brands with their mapping status and master brand info."""
+    """Return source brands with their mapping status and master brand info.
+    visibility: active | inactive | archived | all
+    """
     _ensure_brand_columns()
     conn = get_connection()
     cur = conn.cursor()
     try:
         conds  = []
         params = []
+
+        # Visibility filter
+        if visibility == "active":
+            conds.append("dbs.is_active = TRUE AND COALESCE(dbs.archived, FALSE) = FALSE")
+        elif visibility == "inactive":
+            conds.append("dbs.is_active = FALSE AND COALESCE(dbs.archived, FALSE) = FALSE")
+        elif visibility == "archived":
+            conds.append("COALESCE(dbs.archived, FALSE) = TRUE")
+        # "all" → no filter
 
         if source_id:
             conds.append("dbs.source_id = %s")
@@ -346,6 +369,32 @@ def get_staged(
 
         where = ("WHERE " + " AND ".join(conds)) if conds else ""
 
+        # Separate inactive_total count (always without is_active filter for display)
+        inactive_conds = [c for c in conds if 'is_active' not in c]
+        inactive_where = ("WHERE " + " AND ".join(inactive_conds + ["dbs.is_active = FALSE"])) if inactive_conds else "WHERE dbs.is_active = FALSE"
+        inactive_params = [p for c, p in zip(conds, params) if 'is_active' not in c]
+        if source_id:
+            inactive_where = inactive_where  # already in conds
+
+        # Counts for inactive/archived KPIs (without current visibility filter)
+        _src_cond = ("AND dbs.source_id = %s" if source_id else "")
+        _src_p    = [int(source_id)] if source_id else []
+        cur.execute(
+            f"SELECT COUNT(*) FROM dim_brand_source dbs WHERE dbs.is_active = FALSE AND COALESCE(dbs.archived,FALSE)=FALSE {_src_cond}",
+            _src_p,
+        )
+        inactive_total = (cur.fetchone() or [0])[0]
+        cur.execute(
+            f"SELECT COUNT(*) FROM dim_brand_source dbs WHERE COALESCE(dbs.archived,FALSE) = TRUE {_src_cond}",
+            _src_p,
+        )
+        archived_total = (cur.fetchone() or [0])[0]
+        cur.execute(
+            f"SELECT COUNT(*) FROM dim_brand_source dbs WHERE dbs.is_active = TRUE AND COALESCE(dbs.archived,FALSE)=FALSE {_src_cond}",
+            _src_p,
+        )
+        active_total = (cur.fetchone() or [0])[0]
+
         cur.execute(
             f"""SELECT
                     COUNT(*)                                                              AS total,
@@ -392,7 +441,10 @@ def get_staged(
                     dbs.source_level,
                     dbs.source_company_name,
                     dbs.source_is_active,
-                    dbs.source_brand_ref_id
+                    dbs.source_brand_ref_id,
+                COALESCE(dbs.archived, FALSE) AS archived,
+                dbs.archived_at,
+                dbs.archive_reason
                FROM dim_brand_source dbs
                LEFT JOIN brand_source_mapping bsm
                       ON bsm.source_id = dbs.source_id
@@ -451,6 +503,9 @@ def get_staged(
 
         return {
             "total":                int(kpi[0]),
+            "active_total":         int(active_total),
+            "inactive_total":       int(inactive_total),
+            "archived_total":       int(archived_total),
             "pending":              int(kpi[1]),
             "mapped":               int(kpi[2]),
             "rejected":             int(kpi[3]),
@@ -567,6 +622,156 @@ def unmap_brand(body: UnmapRequest, _u=Depends(get_current_user)):
                    mapping_status  = 'pending',
                    confidence      = 0,
                    updated_at      = NOW()
+               WHERE source_id = %s AND source_brand_id = %s""",
+            (body.source_id, body.source_brand_id),
+        )
+        conn.commit()
+        return {"ok": True, "source_brand_id": body.source_brand_id}
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(500, str(exc))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ── Cleanup center (SuperAdmin only) ─────────────────────────────────────────
+
+_ARCHIVABLE_COND = """
+    dbs.is_active = FALSE
+    AND COALESCE(dbs.archived, FALSE) = FALSE
+    AND (bsm.mapping_status IS NULL OR bsm.mapping_status IN ('pending', 'rejected'))
+    AND bsm.master_brand_id IS NULL
+"""
+
+
+def _cleanup_base_query(source_id):
+    src_filter = "AND dbs.source_id = %s" if source_id else ""
+    params = [int(source_id)] if source_id else []
+    return src_filter, params
+
+
+@router.get("/cleanup-preview")
+def cleanup_preview(source_id: Optional[int] = None, _u=Depends(require_superadmin)):
+    """Preview what would be archived — no changes made."""
+    _ensure_brand_columns()
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        src_filter, params = _cleanup_base_query(source_id)
+        base_join = """FROM dim_brand_source dbs
+            LEFT JOIN brand_source_mapping bsm
+                   ON bsm.source_id = dbs.source_id
+                  AND bsm.source_brand_id = dbs.source_brand_id"""
+
+        cur.execute(
+            f"""SELECT COUNT(*) {base_join}
+                WHERE {_ARCHIVABLE_COND} {src_filter}""",
+            params,
+        )
+        can_archive = (cur.fetchone() or [0])[0]
+
+        cur.execute(
+            f"""SELECT COUNT(*) {base_join}
+                WHERE dbs.is_active = FALSE AND COALESCE(dbs.archived,FALSE)=FALSE {src_filter}""",
+            params,
+        )
+        inactive_total = (cur.fetchone() or [0])[0]
+
+        cur.execute(
+            f"""SELECT COUNT(*) {base_join}
+                WHERE dbs.is_active = FALSE AND COALESCE(dbs.archived,FALSE)=FALSE
+                  AND bsm.master_brand_id IS NOT NULL {src_filter}""",
+            params,
+        )
+        skipped_mapped = (cur.fetchone() or [0])[0]
+
+        cur.execute(
+            f"""SELECT dbs.source_brand_id, dbs.source_brand_name, dbs.source_brand_group,
+                       dbs.source_level, dbs.last_seen_at
+                {base_join}
+                WHERE {_ARCHIVABLE_COND} {src_filter}
+                ORDER BY dbs.source_brand_name
+                LIMIT 20""",
+            params,
+        )
+        examples = [
+            {"source_brand_id": r[0], "source_brand_name": r[1],
+             "source_brand_group": r[2], "source_level": r[3],
+             "last_seen_at": str(r[4]) if r[4] else None}
+            for r in cur.fetchall()
+        ]
+        return {
+            "inactive_total":  int(inactive_total),
+            "can_archive":     int(can_archive),
+            "skipped_mapped":  int(skipped_mapped),
+            "examples":        examples,
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.post("/cleanup-inactive-brands")
+def cleanup_inactive_brands(
+    source_id: Optional[int] = None,
+    archive_reason: Optional[str] = "superadmin_cleanup",
+    _u=Depends(require_superadmin),
+):
+    """Archive inactive unbound source brands. SuperAdmin only."""
+    _ensure_brand_columns()
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        src_filter, params = _cleanup_base_query(source_id)
+        base_join = """FROM dim_brand_source dbs
+            LEFT JOIN brand_source_mapping bsm
+                   ON bsm.source_id = dbs.source_id
+                  AND bsm.source_brand_id = dbs.source_brand_id"""
+
+        cur.execute(
+            f"""SELECT COUNT(*) {base_join}
+                WHERE dbs.is_active = FALSE AND COALESCE(dbs.archived,FALSE)=FALSE {src_filter}""",
+            params,
+        )
+        inactive_total = (cur.fetchone() or [0])[0]
+
+        cur.execute(
+            f"""UPDATE dim_brand_source
+                SET archived = TRUE, archived_at = NOW(),
+                    archived_by = %s, archive_reason = %s
+                WHERE id IN (
+                    SELECT dbs.id {base_join}
+                    WHERE {_ARCHIVABLE_COND} {src_filter}
+                )""",
+            [_u["id"], archive_reason or "superadmin_cleanup"] + params,
+        )
+        archived_count = cur.rowcount or 0
+        conn.commit()
+        return {
+            "inactive_total": int(inactive_total),
+            "archived_count": archived_count,
+            "skipped_mapped": int(inactive_total) - archived_count,
+        }
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(500, str(exc))
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.post("/restore-from-archive")
+def restore_from_archive(body: UnmapRequest, _u=Depends(require_superadmin)):
+    """Restore an archived source brand. SuperAdmin only."""
+    _ensure_brand_columns()
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """UPDATE dim_brand_source
+               SET archived = FALSE, archived_at = NULL, archived_by = NULL,
+                   archive_reason = NULL, updated_at = NOW()
                WHERE source_id = %s AND source_brand_id = %s""",
             (body.source_id, body.source_brand_id),
         )
@@ -1226,7 +1431,14 @@ def create_master_from_mapping(body: CreateFromMappingRequest, _u=Depends(get_cu
                    COALESCE(NULLIF(dbs.default_parent_brand_uid,  ''), NULLIF(dbs.source_parent_uid,  '')) AS eff_parent_uid,
                    COALESCE(NULLIF(dbs.default_parent_brand_name, ''), NULLIF(dbs.source_parent_name, '')) AS eff_parent_name,
                    bsm.mapping_status,
-                   bsm.master_brand_id
+                   bsm.master_brand_id,
+                   dbs.source_level,
+                   dbs.source_company_name,
+                   dbs.source_is_active,
+                   dbs.source_brand_ref_id,
+                COALESCE(dbs.archived, FALSE) AS archived,
+                dbs.archived_at,
+                dbs.archive_reason
                FROM dim_brand_source dbs
                LEFT JOIN brand_source_mapping bsm
                       ON bsm.source_id = dbs.source_id
@@ -1238,7 +1450,7 @@ def create_master_from_mapping(body: CreateFromMappingRequest, _u=Depends(get_cu
         if not row:
             raise HTTPException(404, "Source brand not found")
 
-        uid, eff_name, eff_group, eff_parent_uid, eff_parent_name, mapping_status, master_brand_id = row
+        uid, eff_name, eff_group, eff_parent_uid, eff_parent_name, mapping_status, master_brand_id,             dbs_source_level, dbs_source_company, dbs_source_is_active, dbs_source_brand_ref_id = row
 
         # Guard: must be pending and not already in master
         is_mapped = master_brand_id is not None and mapping_status in ("mapped", "auto")
@@ -1272,13 +1484,18 @@ def create_master_from_mapping(body: CreateFromMappingRequest, _u=Depends(get_cu
         # Insert new master brand
         cur.execute(
             """INSERT INTO dim_brand
-                   (brand_uid, brand_name, brand_group, parent_brand_uid, parent_brand_name, is_active)
-               VALUES (%s, %s, %s, %s, %s, TRUE)
+                   (brand_uid, brand_name, brand_group, parent_brand_uid, parent_brand_name, is_active,
+                    source_level, source_company_name, source_is_active, source_brand_ref_id)
+               VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s)
                RETURNING id""",
             (
                 uid, name, group,
                 (eff_parent_uid  or "").strip() or None,
                 (eff_parent_name or "").strip() or None,
+                dbs_source_level or None,
+                dbs_source_company or None,
+                dbs_source_is_active or None,
+                dbs_source_brand_ref_id or None,
             ),
         )
         new_id = cur.fetchone()[0]

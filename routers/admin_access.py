@@ -278,6 +278,20 @@ def ensure_admin_tables() -> None:
                 (admin_user_id, admin_role_id),
             )
 
+        # Seed SuperAdmin role and assign to admin@metricore.com.ua
+        cur.execute("""
+            INSERT INTO roles (role_name, description, is_active)
+            VALUES ('SuperAdmin', 'Повний доступ + небезпечні операції', TRUE)
+            ON CONFLICT (role_name) DO NOTHING
+        """)
+        cur.execute("SELECT id FROM roles WHERE role_name = 'SuperAdmin'")
+        sa_row = cur.fetchone()
+        if sa_row and admin_user_id:
+            cur.execute(
+                "INSERT INTO user_roles (user_id, role_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (admin_user_id, sa_row[0]),
+            )
+
         conn.commit()
         _tables_ensured = True
         print("[startup] ensure_admin_tables: done")
