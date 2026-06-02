@@ -36,10 +36,13 @@ from services.import_engine import ensure_import_engine_tables
 from routers.brands import router as brands_router, ensure_brand_table
 from routers.brand_source_mapping import router as brand_source_mapping_router
 from routers.department_source_mapping import router as department_source_mapping_router
+from routers.user_preferences import router as user_preferences_router, ensure_user_preferences_table
 from services.article_import_service import (
     ensure_source_staging_tables,
     migrate_legacy_article_mappings,
 )
+from routers.planning import router as planning_router
+from services.planning_engine import ensure_planning_tables
 
 app = FastAPI(title="Planning Web")
 
@@ -66,6 +69,8 @@ def init_db():
     ensure_soft_delete_columns()
     ensure_brand_table()
     ensure_import_engine_tables()
+    ensure_planning_tables()
+    ensure_user_preferences_table()
 
 
 # Permission enforcement (must be added before CORS to run after it in Starlette chain)
@@ -114,6 +119,8 @@ app.include_router(import_engine_router)
 app.include_router(brands_router)
 app.include_router(brand_source_mapping_router)
 app.include_router(department_source_mapping_router)
+app.include_router(planning_router)
+app.include_router(user_preferences_router)
 
 
 FRONT_BUILD_DIR = r"T:\planning_front\build"

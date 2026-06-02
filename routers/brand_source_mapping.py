@@ -3,12 +3,23 @@ Brand / НГ source mapping — HTTP endpoints.
 Manages dim_brand_source ↔ brand_source_mapping ↔ dim_brand correspondence.
 """
 
-from typing import Optional
+import logging
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+log = logging.getLogger("brand_mapping")
+
 from auth.dependencies import get_current_user, require_admin, require_superadmin
 from db import get_connection
+from services.audit_service import log_action
+from services.brand_matching_service import (
+    normalize_brand_name,
+    find_best_match,
+    batch_find_suggestions,
+    get_recommendation,
+    compute_match_score,
+)
 
 router = APIRouter(prefix="/api/brand-source-mapping")
 
@@ -160,8 +171,14 @@ def _ensure_brand_columns():
             "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS source_company_name TEXT",
             "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS source_is_active TEXT",
             "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS source_brand_ref_id TEXT",
+            "ALTER TABLE dim_brand ADD COLUMN IF NOT EXISTS normalized_name TEXT",
         ]:
             cur.execute(ddl)
+        # Index cannot be inside a transaction on some Postgres versions, but IF NOT EXISTS is safe
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dim_brand_normalized"
+            " ON dim_brand(normalized_name) WHERE normalized_name IS NOT NULL"
+        )
         conn.commit()
         _defaults_initialized = True
     finally:
@@ -274,6 +291,8 @@ def _row_to_staged(r) -> dict:
         "archived":              bool(r[31]) if len(r) > 31 and r[31] is not None else False,
         "archived_at":           str(r[32]) if len(r) > 32 and r[32] else None,
         "archive_reason":        r[33] if len(r) > 33 else None,
+        "mapped_at":             str(r[34]) if len(r) > 34 and r[34] else None,
+        "mapped_by":             r[35] if len(r) > 35 else None,
     }
 
 
@@ -293,51 +312,57 @@ def get_staged(
     source_level:       Optional[str] = None,
     source_is_active:   Optional[str] = None,
     visibility:         str = "active",
+    recommendation:     Optional[str] = None,
     page:               int = 1,
     page_size:          int = 100,
     _u=Depends(get_current_user),
 ):
     """Return source brands with their mapping status and master brand info.
     visibility: active | inactive | archived | all
+
+    Pagination contract:
+    - COUNT and data queries use the IDENTICAL CTE — they are always consistent.
+    - `recommendation` filter is computed server-side per page and returned in each row;
+      filtering by it is a CLIENT-SIDE operation (do not re-fetch on recommendation change).
+    - Counters are split into two groups:
+        Processing status (global, DB):  cnt_unprocessed / cnt_linked / cnt_rejected
+        Recommendation  (this page only): rec_auto / rec_match / rec_review / rec_create
     """
     _ensure_brand_columns()
     conn = get_connection()
     cur = conn.cursor()
     try:
+        # ── Build WHERE conditions ────────────────────────────────────────────
         conds  = []
         params = []
 
-        # Visibility filter
         if visibility == "active":
             conds.append("dbs.is_active = TRUE AND COALESCE(dbs.archived, FALSE) = FALSE")
         elif visibility == "inactive":
             conds.append("dbs.is_active = FALSE AND COALESCE(dbs.archived, FALSE) = FALSE")
         elif visibility == "archived":
             conds.append("COALESCE(dbs.archived, FALSE) = TRUE")
-        # "all" → no filter
+        # "all" → no visibility filter
 
         if source_id:
-            conds.append("dbs.source_id = %s")
-            params.append(source_id)
+            conds.append("dbs.source_id = %s"); params.append(source_id)
 
         if mapping_status:
             if mapping_status == "pending":
                 conds.append("(bsm.mapping_status = 'pending' OR bsm.mapping_status IS NULL)")
+            elif mapping_status == "linked":
+                conds.append("bsm.mapping_status IN ('mapped', 'auto')")
             else:
-                conds.append("bsm.mapping_status = %s")
-                params.append(mapping_status)
+                conds.append("bsm.mapping_status = %s"); params.append(mapping_status)
 
         if brand_group:
-            conds.append("dbs.source_brand_group ILIKE %s")
-            params.append(f"%{brand_group}%")
+            conds.append("dbs.source_brand_group ILIKE %s"); params.append(f"%{brand_group}%")
 
         if master_brand_id:
-            conds.append("bsm.master_brand_id = %s")
-            params.append(master_brand_id)
+            conds.append("bsm.master_brand_id = %s"); params.append(master_brand_id)
 
         if master_brand_group:
-            conds.append("b.brand_group ILIKE %s")
-            params.append(f"%{master_brand_group}%")
+            conds.append("b.brand_group ILIKE %s"); params.append(f"%{master_brand_group}%")
 
         if search:
             conds.append(
@@ -348,79 +373,45 @@ def get_staged(
             params += [f"%{search}%", f"%{search}%", f"%{search}%"]
 
         if source_changed is not None:
-            conds.append("dbs.source_changed = %s")
-            params.append(source_changed)
+            conds.append("dbs.source_changed = %s"); params.append(source_changed)
 
         if computed_status:
-            conds.append(f"({_COMPUTED_STATUS}) = %s")
-            params.append(computed_status)
+            conds.append(f"({_COMPUTED_STATUS}) = %s"); params.append(computed_status)
 
         if company:
-            conds.append("dbs.source_company_name ILIKE %s")
-            params.append(f"%{company}%")
+            conds.append("dbs.source_company_name ILIKE %s"); params.append(f"%{company}%")
 
         if source_level:
-            conds.append("dbs.source_level ILIKE %s")
-            params.append(f"%{source_level}%")
+            conds.append("dbs.source_level ILIKE %s"); params.append(f"%{source_level}%")
 
         if source_is_active is not None and source_is_active != "":
-            conds.append("LOWER(dbs.source_is_active) = LOWER(%s)")
-            params.append(source_is_active)
+            conds.append("LOWER(dbs.source_is_active) = LOWER(%s)"); params.append(source_is_active)
 
         where = ("WHERE " + " AND ".join(conds)) if conds else ""
 
-        # Separate inactive_total count (always without is_active filter for display)
-        inactive_conds = [c for c in conds if 'is_active' not in c]
-        inactive_where = ("WHERE " + " AND ".join(inactive_conds + ["dbs.is_active = FALSE"])) if inactive_conds else "WHERE dbs.is_active = FALSE"
-        inactive_params = [p for c, p in zip(conds, params) if 'is_active' not in c]
-        if source_id:
-            inactive_where = inactive_where  # already in conds
+        log.debug(
+            "[get_staged] filters=%s visibility=%s page=%s page_size=%s where=%s",
+            params, visibility, page, page_size, where,
+        )
 
-        # Counts for inactive/archived KPIs (without current visibility filter)
-        _src_cond = ("AND dbs.source_id = %s" if source_id else "")
-        _src_p    = [int(source_id)] if source_id else []
-        cur.execute(
-            f"SELECT COUNT(*) FROM dim_brand_source dbs WHERE dbs.is_active = FALSE AND COALESCE(dbs.archived,FALSE)=FALSE {_src_cond}",
-            _src_p,
-        )
-        inactive_total = (cur.fetchone() or [0])[0]
-        cur.execute(
-            f"SELECT COUNT(*) FROM dim_brand_source dbs WHERE COALESCE(dbs.archived,FALSE) = TRUE {_src_cond}",
-            _src_p,
-        )
-        archived_total = (cur.fetchone() or [0])[0]
-        cur.execute(
-            f"SELECT COUNT(*) FROM dim_brand_source dbs WHERE dbs.is_active = TRUE AND COALESCE(dbs.archived,FALSE)=FALSE {_src_cond}",
-            _src_p,
-        )
-        active_total = (cur.fetchone() or [0])[0]
+        # ── CTE: single source-of-truth for all rows matching current filters ─
+        # Both the COUNT query and the data query reference this exact same expression.
+        # This guarantees that total == number of rows across all pages.
+        _JOIN = """
+            FROM dim_brand_source dbs
+            LEFT JOIN brand_source_mapping bsm
+                   ON bsm.source_id       = dbs.source_id
+                  AND bsm.source_brand_id = dbs.source_brand_id
+            LEFT JOIN dim_brand b ON b.id = bsm.master_brand_id
+        """
 
-        cur.execute(
-            f"""SELECT
-                    COUNT(*)                                                              AS total,
-                    COUNT(*) FILTER (WHERE bsm.mapping_status = 'pending'
-                                      OR   bsm.mapping_status IS NULL)                   AS pending,
-                    COUNT(*) FILTER (WHERE bsm.mapping_status = 'mapped')                AS mapped,
-                    COUNT(*) FILTER (WHERE bsm.mapping_status = 'rejected')              AS rejected,
-                    COUNT(*) FILTER (WHERE bsm.mapping_status = 'auto')                  AS auto_bound,
-                    COUNT(*) FILTER (WHERE dbs.source_changed = TRUE)                      AS source_changed_count
-               FROM dim_brand_source dbs
-               LEFT JOIN brand_source_mapping bsm
-                      ON bsm.source_id = dbs.source_id
-                     AND bsm.source_brand_id = dbs.source_brand_id
-               LEFT JOIN dim_brand b ON b.id = bsm.master_brand_id
-               {where}""",
-            params,
-        )
-        kpi = cur.fetchone()
-
-        offset = (page - 1) * page_size
-        cur.execute(
-            f"""SELECT
-                    dbs.id, dbs.source_id, dbs.source_name,
-                    dbs.source_brand_id, dbs.source_brand_name,
+        cte_body = f"""
+            WITH filtered AS (
+                SELECT
+                    dbs.id,           dbs.source_id,    dbs.source_name,
+                    dbs.source_brand_id,  dbs.source_brand_name,
                     dbs.source_brand_group, dbs.source_parent_uid, dbs.source_parent_name,
-                    dbs.loaded_at, dbs.is_active,
+                    dbs.loaded_at,    dbs.is_active,
                     bsm.id           AS mapping_id,
                     bsm.mapping_status,
                     bsm.master_brand_id,
@@ -442,83 +433,179 @@ def get_staged(
                     dbs.source_company_name,
                     dbs.source_is_active,
                     dbs.source_brand_ref_id,
-                COALESCE(dbs.archived, FALSE) AS archived,
-                dbs.archived_at,
-                dbs.archive_reason
-               FROM dim_brand_source dbs
-               LEFT JOIN brand_source_mapping bsm
-                      ON bsm.source_id = dbs.source_id
-                     AND bsm.source_brand_id = dbs.source_brand_id
-               LEFT JOIN dim_brand b ON b.id = bsm.master_brand_id
-               {where}
-               ORDER BY
-                   CASE WHEN bsm.mapping_status = 'pending' OR bsm.mapping_status IS NULL THEN 0
-                        WHEN bsm.mapping_status = 'mapped'  THEN 1
-                        WHEN bsm.mapping_status = 'auto'    THEN 2
-                        ELSE 3 END,
-                   dbs.source_brand_name
-               LIMIT %s OFFSET %s""",
+                    COALESCE(dbs.archived, FALSE) AS archived,
+                    dbs.archived_at,
+                    dbs.archive_reason,
+                    bsm.updated_at  AS mapped_at,
+                    bsm.mapped_by
+                {_JOIN}
+                {where}
+            )
+        """
+
+        # ── 1. Total count (identical WHERE as data query) ────────────────────
+        cur.execute(f"{cte_body} SELECT COUNT(*) FROM filtered", params)
+        total = int((cur.fetchone() or [0])[0])
+        page_size = min(max(page_size, 1), 500)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        offset = (max(page, 1) - 1) * page_size
+
+        log.debug("[get_staged] total=%s total_pages=%s page=%s offset=%s", total, total_pages, page, offset)
+
+        # ── 2. Paginated data (same CTE body) ────────────────────────────────
+        cur.execute(
+            f"""{cte_body}
+            SELECT * FROM filtered
+            ORDER BY
+                CASE WHEN mapping_status = 'pending' OR mapping_status IS NULL THEN 0
+                     WHEN mapping_status = 'mapped'  THEN 1
+                     WHEN mapping_status = 'auto'    THEN 2
+                     ELSE 3 END,
+                source_brand_name
+            LIMIT %s OFFSET %s""",
             params + [page_size, offset],
         )
         rows = [_row_to_staged(r) for r in cur.fetchall()]
 
+        log.debug("[get_staged] returned_rows=%s", len(rows))
+
+        # ── 3. Global processing-status counters (DB, all rows for current non-visibility filters)
+        _VISIBILITY_KEYWORDS = ("dbs.is_active", "COALESCE(dbs.archived")
+        base_conds  = [c for c in conds if not any(kw in c for kw in _VISIBILITY_KEYWORDS)]
+        base_params = params  # visibility conds never add %s params
+        base_where  = ("WHERE " + " AND ".join(base_conds)) if base_conds else ""
+
         cur.execute(
-            """SELECT DISTINCT dbs.source_id, dbs.source_name
-               FROM dim_brand_source dbs
-               ORDER BY dbs.source_name"""
+            f"""SELECT
+                    -- lifecycle (ignoring visibility filter so all tabs see correct totals)
+                    COUNT(*) FILTER (WHERE dbs.is_active = TRUE  AND COALESCE(dbs.archived,FALSE)=FALSE),
+                    COUNT(*) FILTER (WHERE dbs.is_active = FALSE AND COALESCE(dbs.archived,FALSE)=FALSE),
+                    COUNT(*) FILTER (WHERE COALESCE(dbs.archived,FALSE) = TRUE),
+                    -- processing status (unprocessed / linked / rejected)
+                    COUNT(*) FILTER (WHERE bsm.mapping_status = 'pending' OR bsm.mapping_status IS NULL),
+                    COUNT(*) FILTER (WHERE bsm.mapping_status IN ('mapped', 'auto')),
+                    COUNT(*) FILTER (WHERE bsm.mapping_status = 'rejected'),
+                    -- detail breakdown (for legacy pill buttons)
+                    COUNT(*) FILTER (WHERE bsm.mapping_status = 'mapped'),
+                    COUNT(*) FILTER (WHERE bsm.mapping_status = 'auto'),
+                    COUNT(*) FILTER (WHERE dbs.source_changed = TRUE)
+               {_JOIN}
+               {base_where}""",
+            base_params,
         )
+        kpi = cur.fetchone()
+        active_total   = int(kpi[0] or 0)
+        inactive_total = int(kpi[1] or 0)
+        archived_total = int(kpi[2] or 0)
+        cnt_unprocessed = int(kpi[3] or 0)  # processing status: not yet handled
+        cnt_linked      = int(kpi[4] or 0)  # processing status: bound to master
+        cnt_rejected    = int(kpi[5] or 0)  # processing status: rejected
+        cnt_mapped_only = int(kpi[6] or 0)
+        cnt_auto_only   = int(kpi[7] or 0)
+        source_changed_count = int(kpi[8] or 0)
+
+        # ── 4. Suggestion engine for pending rows on this page ────────────────
+        if rows and any(r.get("mapping_status") in ("pending", None) for r in rows):
+            cur.execute(
+                """SELECT id, brand_name, brand_group,
+                          COALESCE(normalized_name, '') as normalized_name
+                   FROM dim_brand WHERE is_active = TRUE"""
+            )
+            masters_raw = cur.fetchall()
+            cur.execute(
+                """SELECT master_brand_id, COUNT(*) FROM brand_source_mapping
+                   WHERE master_brand_id IS NOT NULL GROUP BY master_brand_id"""
+            )
+            sources_count = {r[0]: r[1] for r in cur.fetchall()}
+            masters = [
+                {
+                    "id": r[0], "brand_name": r[1] or "", "brand_group": r[2] or "",
+                    "normalized_name": r[3] or normalize_brand_name(r[1] or ""),
+                    "mapped_sources_count": sources_count.get(r[0], 0),
+                }
+                for r in masters_raw
+            ]
+            pending_rows = {r["source_brand_id"]: r["source_brand_name"] for r in rows
+                            if r.get("mapping_status") in ("pending", None)}
+            if pending_rows and masters:
+                source_list = [{"source_brand_id": k, "source_brand_name": v}
+                                for k, v in pending_rows.items()]
+                suggestions = batch_find_suggestions(source_list, masters)
+                for row in rows:
+                    if row.get("source_brand_id") in suggestions:
+                        row.update(suggestions[row["source_brand_id"]])
+                    else:
+                        row.setdefault("suggested_master_brand_id", None)
+                        row.setdefault("match_score", None)
+                        row.setdefault("recommendation", None)
+                        row.setdefault("normalized_source_name", None)
+
+        # ── 5. Recommendation counters from THIS PAGE rows only ───────────────
+        # NOTE: These count rows on the current page, not globally.
+        # Clients must not rely on them for global KPIs.
+        rec_auto   = sum(1 for r in rows if r.get("recommendation") == "AUTO_BIND")
+        rec_match  = sum(1 for r in rows if r.get("recommendation") == "RECOMMEND_BIND")
+        rec_review = sum(1 for r in rows if r.get("recommendation") == "REVIEW")
+        rec_create = sum(1 for r in rows if r.get("recommendation") == "CREATE")
+
+        # ── 6. Filter dropdown options ────────────────────────────────────────
+        cur.execute("SELECT DISTINCT dbs.source_id, dbs.source_name FROM dim_brand_source dbs ORDER BY dbs.source_name")
         sources = [{"id": r[0], "name": r[1]} for r in cur.fetchall()]
 
-        cur.execute(
-            """SELECT DISTINCT source_brand_group
-               FROM dim_brand_source
-               WHERE source_brand_group IS NOT NULL AND source_brand_group != ''
-               ORDER BY source_brand_group"""
-        )
+        cur.execute("SELECT DISTINCT source_brand_group FROM dim_brand_source WHERE source_brand_group IS NOT NULL AND source_brand_group != '' ORDER BY source_brand_group")
         source_groups = [r[0] for r in cur.fetchall()]
 
-        cur.execute(
-            """SELECT DISTINCT source_company_name
-               FROM dim_brand_source
-               WHERE source_company_name IS NOT NULL AND source_company_name != ''
-               ORDER BY source_company_name"""
-        )
+        cur.execute("SELECT DISTINCT source_company_name FROM dim_brand_source WHERE source_company_name IS NOT NULL AND source_company_name != '' ORDER BY source_company_name")
         companies = [r[0] for r in cur.fetchall()]
 
-        cur.execute(
-            """SELECT DISTINCT source_level
-               FROM dim_brand_source
-               WHERE source_level IS NOT NULL AND source_level != ''
-               ORDER BY source_level"""
-        )
+        cur.execute("SELECT DISTINCT source_level FROM dim_brand_source WHERE source_level IS NOT NULL AND source_level != '' ORDER BY source_level")
         levels = [r[0] for r in cur.fetchall()]
 
-        cur.execute(
-            """SELECT DISTINCT source_is_active
-               FROM dim_brand_source
-               WHERE source_is_active IS NOT NULL AND source_is_active != ''
-               ORDER BY source_is_active"""
-        )
+        cur.execute("SELECT DISTINCT source_is_active FROM dim_brand_source WHERE source_is_active IS NOT NULL AND source_is_active != '' ORDER BY source_is_active")
         active_values = [r[0] for r in cur.fetchall()]
 
         return {
-            "total":                int(kpi[0]),
-            "active_total":         int(active_total),
-            "inactive_total":       int(inactive_total),
-            "archived_total":       int(archived_total),
-            "pending":              int(kpi[1]),
-            "mapped":               int(kpi[2]),
-            "rejected":             int(kpi[3]),
-            "auto_bound":           int(kpi[4]),
-            "source_changed_count": int(kpi[5]) if kpi[5] is not None else 0,
-            "page":                 page,
-            "page_size":            page_size,
-            "rows":                 rows,
-            "sources":              sources,
-            "source_groups":        source_groups,
-            "companies":            companies,
-            "levels":               levels,
-            "active_values":        active_values,
+            # Pagination
+            "total":       total,
+            "total_pages": total_pages,
+            "page":        page,
+            "page_size":   page_size,
+
+            # Lifecycle (global, ignoring visibility)
+            "active_total":   active_total,
+            "inactive_total": inactive_total,
+            "archived_total": archived_total,
+
+            # Processing status counters (global, DB — two clearly separated concepts)
+            "cnt_unprocessed": cnt_unprocessed,  # pending / null — not yet handled
+            "cnt_linked":      cnt_linked,        # mapped + auto — bound to master
+            "cnt_rejected":    cnt_rejected,       # rejected
+
+            # Legacy names kept for backward compat with existing filters/buttons
+            "pending":    cnt_unprocessed,
+            "mapped":     cnt_mapped_only,
+            "auto_bound": cnt_auto_only,
+            "rejected":   cnt_rejected,
+            "source_changed_count": source_changed_count,
+
+            # Recommendation counters — CURRENT PAGE ONLY, not global
+            "rec_auto":   rec_auto,    # AUTO_BIND   (score >= 95)
+            "rec_match":  rec_match,   # RECOMMEND_BIND (score >= 80)
+            "rec_review": rec_review,  # REVIEW      (score >= 60)
+            "rec_create": rec_create,  # CREATE      (score < 60)
+
+            # Legacy recommendation names (for "Bind all AUTO" button)
+            "auto_bind_candidates": rec_auto,
+            "recommend_bind_count": rec_match,
+            "review_count":         rec_review,
+            "create_candidates":    rec_create,
+
+            "rows":          rows,
+            "sources":       sources,
+            "source_groups": source_groups,
+            "companies":     companies,
+            "levels":        levels,
+            "active_values": active_values,
         }
     finally:
         cur.close()
@@ -718,7 +805,9 @@ def cleanup_inactive_brands(
     archive_reason: Optional[str] = "superadmin_cleanup",
     _u=Depends(require_superadmin),
 ):
-    """Archive inactive unbound source brands. SuperAdmin only."""
+    """Archive inactive unbound source brands. SuperAdmin only.
+    Uses CTE with re-check to prevent race conditions.
+    """
     _ensure_brand_columns()
     conn = get_connection()
     cur = conn.cursor()
@@ -729,6 +818,7 @@ def cleanup_inactive_brands(
                    ON bsm.source_id = dbs.source_id
                   AND bsm.source_brand_id = dbs.source_brand_id"""
 
+        # Count inactive total (for reporting)
         cur.execute(
             f"""SELECT COUNT(*) {base_join}
                 WHERE dbs.is_active = FALSE AND COALESCE(dbs.archived,FALSE)=FALSE {src_filter}""",
@@ -736,18 +826,42 @@ def cleanup_inactive_brands(
         )
         inactive_total = (cur.fetchone() or [0])[0]
 
+        # Atomic re-check + archive in one statement (prevents race condition)
+        # CTE selects archivable IDs at the moment of execution — not at preview time
         cur.execute(
-            f"""UPDATE dim_brand_source
-                SET archived = TRUE, archived_at = NOW(),
-                    archived_by = %s, archive_reason = %s
-                WHERE id IN (
+            f"""WITH archivable AS (
                     SELECT dbs.id {base_join}
                     WHERE {_ARCHIVABLE_COND} {src_filter}
-                )""",
+                    FOR UPDATE OF dbs SKIP LOCKED
+                )
+                UPDATE dim_brand_source
+                SET archived = TRUE, archived_at = NOW(),
+                    archived_by = %s, archive_reason = %s
+                WHERE id IN (SELECT id FROM archivable)
+                RETURNING id""",
             [_u["id"], archive_reason or "superadmin_cleanup"] + params,
         )
-        archived_count = cur.rowcount or 0
+        archived_ids = [r[0] for r in cur.fetchall()]
+        archived_count = len(archived_ids)
+
         conn.commit()
+
+        # Audit log
+        log_action(
+            action="brand_source_archive",
+            user_id=_u["id"],
+            user_email=_u.get("email"),
+            entity_type="dim_brand_source",
+            entity_id=str(source_id) if source_id else "all",
+            menu_key="brand_correspondence",
+            new_value={
+                "archived_count": archived_count,
+                "inactive_total": int(inactive_total),
+                "skipped_mapped": int(inactive_total) - archived_count,
+                "archive_reason": archive_reason or "superadmin_cleanup",
+                "source_id": source_id,
+            },
+        )
         return {
             "inactive_total": int(inactive_total),
             "archived_count": archived_count,
@@ -776,6 +890,16 @@ def restore_from_archive(body: UnmapRequest, _u=Depends(require_superadmin)):
             (body.source_id, body.source_brand_id),
         )
         conn.commit()
+
+        log_action(
+            action="brand_source_restore",
+            user_id=_u["id"],
+            user_email=_u.get("email"),
+            entity_type="dim_brand_source",
+            entity_id=body.source_brand_id,
+            menu_key="brand_correspondence",
+            new_value={"source_id": body.source_id, "source_brand_id": body.source_brand_id},
+        )
         return {"ok": True, "source_brand_id": body.source_brand_id}
     except Exception as exc:
         conn.rollback()
@@ -1435,10 +1559,7 @@ def create_master_from_mapping(body: CreateFromMappingRequest, _u=Depends(get_cu
                    dbs.source_level,
                    dbs.source_company_name,
                    dbs.source_is_active,
-                   dbs.source_brand_ref_id,
-                COALESCE(dbs.archived, FALSE) AS archived,
-                dbs.archived_at,
-                dbs.archive_reason
+                   dbs.source_brand_ref_id
                FROM dim_brand_source dbs
                LEFT JOIN brand_source_mapping bsm
                       ON bsm.source_id = dbs.source_id
@@ -1518,6 +1639,116 @@ def create_master_from_mapping(body: CreateFromMappingRequest, _u=Depends(get_cu
         return {"ok": True, "master_brand_id": new_id, "brand_uid": uid, "brand_name": name}
     except HTTPException:
         raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(500, str(exc))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ── Similar brands lookup ──────────────────────────────────────────────────────
+
+@router.get("/similar-brands")
+def get_similar_brands(
+    source_brand_name: str,
+    limit: int = 10,
+    _u=Depends(get_current_user),
+):
+    """Return top N similar master brands for a given source brand name."""
+    _ensure_brand_columns()
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT id, brand_name, brand_group,
+                      COALESCE(normalized_name, '') as normalized_name
+               FROM dim_brand WHERE is_active = TRUE"""
+        )
+        masters_raw = cur.fetchall()
+        cur.execute(
+            """SELECT master_brand_id, COUNT(*) FROM brand_source_mapping
+               WHERE master_brand_id IS NOT NULL GROUP BY master_brand_id"""
+        )
+        sources_count = {r[0]: r[1] for r in cur.fetchall()}
+        masters = [
+            {
+                "id": r[0],
+                "brand_name": r[1] or "",
+                "brand_group": r[2] or "",
+                "normalized_name": r[3] or normalize_brand_name(r[1] or ""),
+                "mapped_sources_count": sources_count.get(r[0], 0),
+            }
+            for r in masters_raw
+        ]
+
+        src_norm = normalize_brand_name(source_brand_name)
+        scored = []
+        for m in masters:
+            score = compute_match_score(src_norm, m["normalized_name"])
+            if score >= 50:
+                scored.append({
+                    "master_brand_id":       m["id"],
+                    "master_brand_name":     m["brand_name"],
+                    "master_brand_group":    m["brand_group"],
+                    "match_score":           score,
+                    "recommendation":        get_recommendation(score),
+                    "mapped_sources_count":  m["mapped_sources_count"],
+                })
+        scored.sort(key=lambda x: -x["match_score"])
+        return scored[:limit]
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ── Bulk auto-bind ─────────────────────────────────────────────────────────────
+
+class AutoBindPair(BaseModel):
+    source_id:       int
+    source_brand_id: str
+    master_brand_id: int
+
+
+class BulkAutoBindRequest(BaseModel):
+    pairs: List[AutoBindPair]
+
+
+@router.post("/bulk-auto-bind")
+def bulk_auto_bind(body: BulkAutoBindRequest, _u=Depends(get_current_user)):
+    """Bind multiple source brands to master brands in one transaction."""
+    if not body.pairs:
+        return {"bound": 0}
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        bound = 0
+        for pair in body.pairs:
+            cur.execute(
+                """INSERT INTO brand_source_mapping
+                       (source_id, source_brand_id, master_brand_id, mapping_status, confidence, mapped_by)
+                   VALUES (%s, %s, %s, 'auto', 100, %s)
+                   ON CONFLICT (source_id, source_brand_id) DO UPDATE
+                   SET master_brand_id = EXCLUDED.master_brand_id,
+                       mapping_status = 'auto',
+                       confidence = 100,
+                       mapped_by = EXCLUDED.mapped_by,
+                       updated_at = NOW()
+                   WHERE brand_source_mapping.mapping_status IN ('pending', 'rejected')
+                      OR brand_source_mapping.master_brand_id IS NULL""",
+                (pair.source_id, pair.source_brand_id, pair.master_brand_id, _u["id"]),
+            )
+            bound += cur.rowcount or 0
+        conn.commit()
+        log_action(
+            action="brand_bulk_auto_bind",
+            user_id=_u["id"],
+            user_email=_u.get("email"),
+            entity_type="brand_source_mapping",
+            menu_key="brand_correspondence",
+            new_value={"bound_count": bound, "pairs_count": len(body.pairs)},
+        )
+        return {"bound": bound}
     except Exception as exc:
         conn.rollback()
         raise HTTPException(500, str(exc))

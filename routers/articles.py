@@ -1,4 +1,8 @@
+import csv
+import io
+from datetime import datetime
 from fastapi import APIRouter, Form, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from typing import Optional, List
 from pydantic import BaseModel
 from db import get_connection
@@ -576,5 +580,151 @@ def merge_articles(body: MergeRequest, _u=Depends(get_current_user)):
         conn.rollback(); raise
     except Exception as exc:
         conn.rollback(); raise HTTPException(500, str(exc))
+    finally:
+        cur.close(); conn.close()
+
+
+# ── CSV export ────────────────────────────────────────────────────────────────
+
+class ExportCsvRequest(BaseModel):
+    selected_ids:         List[str]      = []
+    search:               Optional[str]  = None
+    article_type:         Optional[str]  = None
+    is_active:            Optional[str]  = None
+    level1:               Optional[str]  = None
+    level2:               Optional[str]  = None
+    pnl_id:               Optional[int]  = None
+    uid_expense_article:  Optional[str]  = None
+    expense_element:      Optional[str]  = None
+    expense_company:      Optional[str]  = None
+    level1_olap:          Optional[str]  = None
+    level2_olap:          Optional[str]  = None
+    only_with_uid:        bool           = False
+    only_without_uid:     bool           = False
+    only_without_element: bool           = False
+    only_dup_name:        bool           = False
+    only_dup_uid:         bool           = False
+    hide_merged:          bool           = True
+
+
+_CSV_COLUMNS = [
+    ("article_id",           "ID статті"),
+    ("article_name",         "Назва статті"),
+    ("article_type",         "Тип"),
+    ("level1",               "Level 1"),
+    ("level2",               "Level 2"),
+    ("pnl_id",               "PnL ID"),
+    ("uid_expense_article",  "UID статті"),
+    ("expense_element",      "Елемент витрат"),
+    ("expense_company",      "Компанія"),
+    ("level1_olap",          "Level 1 OLAP"),
+    ("level2_olap",          "Level 2 OLAP"),
+    ("is_active",            "Активна"),
+    ("merged_into_article_id", "Об'єднано в"),
+]
+
+
+@router.post("/export-csv")
+def export_csv(body: ExportCsvRequest, _u=Depends(get_current_user)):
+    ensure_article_columns()
+    _ensure_merge_columns()
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        if body.selected_ids:
+            # Export only selected rows — ignore filters
+            cur.execute(
+                f"SELECT {_SELECT} FROM dim_article WHERE article_id = ANY(%s)"
+                " ORDER BY level2, level1, article_name",
+                (body.selected_ids,),
+            )
+        else:
+            # Build same WHERE as the main GET endpoint
+            where  = ["1=1"]
+            params = []
+
+            if body.search:
+                where.append(
+                    "(article_id ILIKE %s OR article_name ILIKE %s OR "
+                    " uid_expense_article ILIKE %s OR expense_element ILIKE %s OR "
+                    " expense_company ILIKE %s OR level1_olap ILIKE %s OR level2_olap ILIKE %s)"
+                )
+                p = f"%{body.search}%"
+                params.extend([p, p, p, p, p, p, p])
+            if body.article_type:
+                where.append("article_type = %s"); params.append(body.article_type)
+            if body.is_active is not None:
+                where.append("is_active = %s")
+                params.append(body.is_active.lower() == "true")
+            if body.level1:
+                where.append("level1 ILIKE %s"); params.append(f"%{body.level1}%")
+            if body.level2:
+                where.append("level2 ILIKE %s"); params.append(f"%{body.level2}%")
+            if body.pnl_id:
+                where.append("pnl_id = %s"); params.append(body.pnl_id)
+            if body.uid_expense_article:
+                where.append("uid_expense_article ILIKE %s"); params.append(f"%{body.uid_expense_article}%")
+            if body.expense_element:
+                where.append("expense_element ILIKE %s"); params.append(f"%{body.expense_element}%")
+            if body.expense_company:
+                where.append("expense_company = %s"); params.append(body.expense_company)
+            if body.level1_olap:
+                where.append("level1_olap ILIKE %s"); params.append(f"%{body.level1_olap}%")
+            if body.level2_olap:
+                where.append("level2_olap ILIKE %s"); params.append(f"%{body.level2_olap}%")
+            if body.only_with_uid:
+                where.append("uid_expense_article IS NOT NULL AND uid_expense_article <> ''")
+            if body.only_without_uid:
+                where.append("(uid_expense_article IS NULL OR uid_expense_article = '')")
+            if body.only_without_element:
+                where.append("(expense_element IS NULL OR expense_element = '')")
+            if body.only_dup_name:
+                where.append(
+                    "LOWER(article_name) IN ("
+                    "  SELECT LOWER(article_name) FROM dim_article"
+                    "  GROUP BY LOWER(article_name) HAVING COUNT(*) > 1)"
+                )
+            if body.only_dup_uid:
+                where.append(
+                    "uid_expense_article IS NOT NULL AND uid_expense_article <> '' AND "
+                    "uid_expense_article IN ("
+                    "  SELECT uid_expense_article FROM dim_article"
+                    "  WHERE uid_expense_article IS NOT NULL AND uid_expense_article <> ''"
+                    "  GROUP BY uid_expense_article HAVING COUNT(*) > 1)"
+                )
+            if body.hide_merged:
+                where.append("(merged_into_article_id IS NULL OR merged_into_article_id = '')")
+
+            cur.execute(
+                f"SELECT {_SELECT} FROM dim_article WHERE {' AND '.join(where)}"
+                " ORDER BY level2, level1, article_name",
+                params,
+            )
+
+        rows = [_row_to_dict(r) for r in cur.fetchall()]
+
+        # Build CSV in memory — UTF-8 BOM, semicolon delimiter (Excel compatible)
+        buf = io.StringIO()
+        buf.write("﻿")  # BOM for Excel UTF-8 detection
+        writer = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL)
+
+        # Header row
+        writer.writerow([label for _, label in _CSV_COLUMNS])
+
+        # Data rows
+        for row in rows:
+            writer.writerow([
+                row.get(col, "") if row.get(col) is not None else ""
+                for col, _ in _CSV_COLUMNS
+            ])
+
+        buf.seek(0)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        filename = f"pnl_articles_{ts}.csv"
+
+        return StreamingResponse(
+            iter([buf.getvalue().encode("utf-8")]),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
     finally:
         cur.close(); conn.close()
