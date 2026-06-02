@@ -243,11 +243,36 @@ def ensure_import_engine_tables():
             "ALTER TABLE staging_sales_fact ADD COLUMN IF NOT EXISTS raw_row JSONB"
         )
         cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_staging_sf_batch ON staging_sales_fact (batch_id)"
+            "CREATE INDEX IF NOT EXISTS idx_staging_sf_batch    ON staging_sales_fact (batch_id)"
         )
         cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_staging_sf_status ON staging_sales_fact (batch_id, validation_status)"
+            "CREATE INDEX IF NOT EXISTS idx_staging_sf_status   ON staging_sales_fact (batch_id, validation_status)"
         )
+        # Performance indexes for paginated/filtered staging queries
+        cur.execute(
+            "ALTER TABLE staging_sales_fact ADD COLUMN IF NOT EXISTS source_id INTEGER"
+        )
+        for _idx in [
+            "CREATE INDEX IF NOT EXISTS idx_staging_sf_source    ON staging_sales_fact (source_id)",
+            "CREATE INDEX IF NOT EXISTS idx_staging_sf_period    ON staging_sales_fact (period_month)",
+            "CREATE INDEX IF NOT EXISTS idx_staging_sf_dept_uid  ON staging_sales_fact (department_uid)",
+            "CREATE INDEX IF NOT EXISTS idx_staging_sf_pg_uid    ON staging_sales_fact (product_group_uid)",
+            "CREATE INDEX IF NOT EXISTS idx_staging_sf_mapping   ON staging_sales_fact (batch_id, mapping_status)",
+            # fact_turnover indexes
+            "CREATE INDEX IF NOT EXISTS idx_ft_period     ON fact_turnover (period_month)",
+            "CREATE INDEX IF NOT EXISTS idx_ft_source     ON fact_turnover (source_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ft_dept_uid   ON fact_turnover (department_uid)",
+            "CREATE INDEX IF NOT EXISTS idx_ft_pg_uid     ON fact_turnover (product_group_uid)",
+            "CREATE INDEX IF NOT EXISTS idx_ft_batch      ON fact_turnover (batch_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ft_dept_name  ON fact_turnover (department_name)",
+            "CREATE INDEX IF NOT EXISTS idx_ft_pg_name    ON fact_turnover (product_group_name)",
+            "CREATE INDEX IF NOT EXISTS idx_ft_pg_id      ON fact_turnover (product_group_id)",
+        ]:
+            try:
+                cur.execute(_idx)
+                conn.commit()
+            except Exception:
+                conn.rollback()
 
         # Mapping columns added for master-reference bulk-update
         for _col in [
@@ -901,36 +926,78 @@ def load_sales_fact_to_staging(
     return rows_loaded, rows_failed, rows_filtered_out, rows_valid, rows_invalid
 
 
-def get_staging_preview(batch_id: int, limit: int = 500,
-                        status_filter: Optional[str] = None) -> dict:
+def get_staging_preview(
+    batch_id: int,
+    limit: int = 100,
+    status_filter: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 100,
+    search: Optional[str] = None,
+    period_month: Optional[str] = None,
+    department_search: Optional[str] = None,
+    product_group_search: Optional[str] = None,
+) -> dict:
+    """
+    Paginated staging preview for sales_fact.
+    Counters (total/valid/invalid/saved) span ALL matching rows — not just current page.
+    """
     conn = get_connection()
     cur = conn.cursor()
     try:
+        conds: list = ["batch_id = %s"]
+        params_base: list = [batch_id]
+
+        if status_filter in ("valid", "invalid"):
+            conds.append("validation_status = %s")
+            params_base.append(status_filter)
+
+        if search and search.strip():
+            conds.append(
+                "(department_name ILIKE %s OR product_group_name ILIKE %s"
+                " OR department_uid ILIKE %s OR product_group_uid ILIKE %s)"
+            )
+            s = f"%{search.strip()}%"
+            params_base += [s, s, s, s]
+
+        if period_month:
+            conds.append("period_month = %s")
+            params_base.append(period_month)
+
+        if department_search and department_search.strip():
+            conds.append("(department_name ILIKE %s OR department_uid ILIKE %s)")
+            ds = f"%{department_search.strip()}%"
+            params_base += [ds, ds]
+
+        if product_group_search and product_group_search.strip():
+            conds.append("(product_group_name ILIKE %s OR product_group_uid ILIKE %s OR product_group_id ILIKE %s)")
+            ps = f"%{product_group_search.strip()}%"
+            params_base += [ps, ps, ps]
+
+        where = " AND ".join(conds)
+
+        # Aggregate counters over ALL matching rows (server-side)
         cur.execute(
-            """SELECT
+            f"""SELECT
                 COUNT(*),
                 COUNT(*) FILTER (WHERE validation_status = 'valid'),
                 COUNT(*) FILTER (WHERE validation_status = 'invalid'),
+                COUNT(*) FILTER (WHERE mapping_status = 'mapped'),
                 MIN(period_month), MAX(period_month),
                 COALESCE(SUM(sales_vat)    FILTER (WHERE validation_status = 'valid'), 0),
                 COALESCE(SUM(sales_retail) FILTER (WHERE validation_status = 'valid'), 0),
                 COALESCE(SUM(excise)       FILTER (WHERE validation_status = 'valid'), 0),
                 COALESCE(SUM(sales_dal)    FILTER (WHERE validation_status = 'valid'), 0),
                 COALESCE(SUM(sales_kg)     FILTER (WHERE validation_status = 'valid'), 0)
-               FROM staging_sales_fact WHERE batch_id = %s""",
-            (batch_id,),
+               FROM staging_sales_fact WHERE {where}""",
+            params_base,
         )
         agg = cur.fetchone()
 
-        where_extra = ""
-        params = [batch_id]
-        if status_filter in ("valid", "invalid"):
-            where_extra = " AND validation_status = %s"
-            params.append(status_filter)
-        params.append(limit)
+        eff_page_size = min(max(page_size, limit), 500)
+        offset = (page - 1) * eff_page_size
 
         cur.execute(
-            """SELECT id, period_month, department_uid, department_name,
+            f"""SELECT id, period_month, department_uid, department_name,
                        product_group_uid, product_group_name,
                        sales_vat, sales_retail, excise, sales_dal, sales_kg,
                        validation_status, validation_error, raw_row,
@@ -938,10 +1005,10 @@ def get_staging_preview(batch_id: int, limit: int = 500,
                        master_brand_id, master_brand_name, master_brand_uid,
                        mapping_status
                 FROM staging_sales_fact
-                WHERE batch_id = %s{extra}
+                WHERE {where}
                 ORDER BY validation_status DESC, id
-                LIMIT %s""".format(extra=where_extra),
-            params,
+                LIMIT %s OFFSET %s""",
+            params_base + [eff_page_size, offset],
         )
         rows = []
         for r in cur.fetchall():
@@ -968,15 +1035,26 @@ def get_staging_preview(batch_id: int, limit: int = 500,
                 "mapping_status":         r[19] or "not_set",
             })
 
+        total   = int(agg[0])
+        valid   = int(agg[1])
+        invalid = int(agg[2])
+        saved   = int(agg[3])
+
         return {
-            "total": int(agg[0]), "valid": int(agg[1]), "invalid": int(agg[2]),
-            "period_from": str(agg[3]) if agg[3] else None,
-            "period_to":   str(agg[4]) if agg[4] else None,
-            "total_sales_vat":    float(agg[5]),
-            "total_sales_retail": float(agg[6]),
-            "total_excise":       float(agg[7]),
-            "total_sales_dal":    float(agg[8]),
-            "total_sales_kg":     float(agg[9]),
+            "total":      total,
+            "valid":      valid,
+            "invalid":    invalid,
+            "saved":      saved,
+            "page":       page,
+            "page_size":  eff_page_size,
+            "total_pages": max(1, (total + eff_page_size - 1) // eff_page_size),
+            "period_from": str(agg[4]) if agg[4] else None,
+            "period_to":   str(agg[5]) if agg[5] else None,
+            "total_sales_vat":    float(agg[6]),
+            "total_sales_retail": float(agg[7]),
+            "total_excise":       float(agg[8]),
+            "total_sales_dal":    float(agg[9]),
+            "total_sales_kg":     float(agg[10]),
             "rows": rows,
         }
     finally:
@@ -1048,8 +1126,60 @@ def commit_sales_fact(batch_id: int, source_id: int,
             (source_id, batch_id),
         )
         committed = cur.rowcount
+
+        # Insert any new (source_id, dept_uid) pairs into department_source_mapping as pending
+        cur.execute(
+            """INSERT INTO department_source_mapping
+                   (source_id, source_department_id, master_department_id, mapping_status, confidence)
+               SELECT DISTINCT %s, department_uid, NULL, 'pending', 0
+               FROM fact_turnover
+               WHERE source_id = %s
+                 AND department_uid IS NOT NULL
+               ON CONFLICT (source_id, source_department_id) DO NOTHING""",
+            (source_id, source_id),
+        )
+        new_pending = cur.rowcount
+
+        # Auto-match those pending rows via normalized UID
+        cur.execute(
+            """UPDATE department_source_mapping target
+               SET master_department_id = sub.master_id,
+                   mapping_status       = 'auto',
+                   confidence           = 90,
+                   mapping_method       = 'uid_auto_match',
+                   updated_at           = NOW()
+               FROM (
+                   SELECT t.source_id, t.source_department_id,
+                          MIN(e.master_department_id) AS master_id
+                   FROM department_source_mapping t
+                   JOIN department_source_mapping e
+                     ON (CASE WHEN e.source_department_id ~ '^[0-9]+_'
+                              THEN regexp_replace(e.source_department_id, '^[0-9]+_', '')
+                              ELSE e.source_department_id END)
+                      = (CASE WHEN t.source_department_id ~ '^[0-9]+_'
+                              THEN regexp_replace(t.source_department_id, '^[0-9]+_', '')
+                              ELSE t.source_department_id END)
+                     AND e.mapping_status IN ('mapped', 'auto')
+                     AND e.master_department_id IS NOT NULL
+                     AND NOT (e.source_id = t.source_id
+                              AND e.source_department_id = t.source_department_id)
+                   WHERE t.source_id = %s
+                     AND t.mapping_status = 'pending'
+                     AND t.master_department_id IS NULL
+                   GROUP BY t.source_id, t.source_department_id
+                   HAVING COUNT(DISTINCT e.master_department_id) = 1
+               ) sub
+               WHERE target.source_id = sub.source_id
+                 AND target.source_department_id = sub.source_department_id
+                 AND target.mapping_status = 'pending'
+                 AND target.master_department_id IS NULL""",
+            (source_id,),
+        )
+        auto_matched = cur.rowcount
+
         conn.commit()
-        print("[commit] Committed {} rows to fact_turnover (batch={})".format(committed, batch_id))
+        print("[commit] Committed {} rows to fact_turnover (batch={}), new_pending={}, auto_matched={}".format(
+            committed, batch_id, new_pending, auto_matched))
         return committed, deleted_from_target
     finally:
         cur.close()
@@ -1306,23 +1436,50 @@ def get_fact_turnover(
     period_from: Optional[str] = None,
     period_to: Optional[str] = None,
     source_id: Optional[int] = None,
-    limit: int = 5000,
+    department_uid: Optional[str] = None,
+    product_group_uid: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 100,
 ) -> dict:
     conn = get_connection()
     cur = conn.cursor()
     try:
         conditions, params = [], []
         if period_from:
-            conditions.append("period_month >= %s")
+            conditions.append("ft.period_month >= %s")
             params.append(period_from)
         if period_to:
-            conditions.append("period_month <= %s")
+            conditions.append("ft.period_month <= %s")
             params.append(period_to)
         if source_id:
-            conditions.append("source_id = %s")
+            conditions.append("ft.source_id = %s")
             params.append(source_id)
+        if department_uid and department_uid.strip():
+            conditions.append("ft.department_uid ILIKE %s")
+            params.append(f"%{department_uid.strip()}%")
+        if product_group_uid and product_group_uid.strip():
+            conditions.append("ft.product_group_uid ILIKE %s")
+            params.append(f"%{product_group_uid.strip()}%")
 
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        # Aggregate totals over entire filtered set (not page-limited)
+        cur.execute(
+            """SELECT COUNT(*),
+                       COALESCE(SUM(sales_vat), 0),
+                       COALESCE(SUM(sales_retail), 0),
+                       COALESCE(SUM(excise), 0),
+                       COALESCE(SUM(sales_dal), 0),
+                       COALESCE(SUM(sales_kg), 0),
+                       MIN(period_month), MAX(period_month)
+                FROM fact_turnover ft {where}""".format(where=where),
+            params,
+        )
+        agg = cur.fetchone()
+        total_count = int(agg[0])
+
+        eff_page_size = min(max(page_size, 1), 500)
+        offset = (page - 1) * eff_page_size
 
         cur.execute(
             """SELECT ft.id, ft.period_month, ft.department_uid, ft.department_name,
@@ -1333,8 +1490,8 @@ def get_fact_turnover(
                 LEFT JOIN import_sources s ON s.id = ft.source_id
                 {where}
                 ORDER BY ft.period_month DESC, ft.department_name, ft.product_group_name
-                LIMIT %s""".format(where=where),
-            params + [limit],
+                LIMIT %s OFFSET %s""".format(where=where),
+            params + [eff_page_size, offset],
         )
         rows = []
         for r in cur.fetchall():
@@ -1355,21 +1512,12 @@ def get_fact_turnover(
                 "batch_id":    r[13],
             })
 
-        cur.execute(
-            """SELECT COUNT(*),
-                       COALESCE(SUM(sales_vat), 0),
-                       COALESCE(SUM(sales_retail), 0),
-                       COALESCE(SUM(excise), 0),
-                       COALESCE(SUM(sales_dal), 0),
-                       COALESCE(SUM(sales_kg), 0),
-                       MIN(period_month), MAX(period_month)
-                FROM fact_turnover ft {where}""".format(where=where),
-            params,
-        )
-        agg = cur.fetchone()
         return {
-            "rows": rows,
-            "total_count": int(agg[0]),
+            "rows":               rows,
+            "total_count":        total_count,
+            "page":               page,
+            "page_size":          eff_page_size,
+            "total_pages":        max(1, (total_count + eff_page_size - 1) // eff_page_size),
             "total_sales_vat":    float(agg[1]),
             "total_sales_retail": float(agg[2]),
             "total_excise":       float(agg[3]),
@@ -1378,6 +1526,68 @@ def get_fact_turnover(
             "period_from": str(agg[6]) if agg[6] else None,
             "period_to":   str(agg[7]) if agg[7] else None,
         }
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_fact_turnover_dept_options(search: str = "", limit: int = 50) -> list:
+    """Return distinct departments from fact_turnover for filter dropdown (server-side search)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conds, params = ["department_uid IS NOT NULL", "department_uid <> ''"], []
+        if search and search.strip():
+            conds.append("(department_name ILIKE %s OR department_uid ILIKE %s)")
+            s = f"%{search.strip()}%"
+            params += [s, s]
+        where = " AND ".join(conds)
+        cur.execute(
+            f"""SELECT DISTINCT department_uid, department_name
+                FROM fact_turnover
+                WHERE {where}
+                ORDER BY department_name
+                LIMIT %s""",
+            params + [min(limit, 200)],
+        )
+        return [
+            {"department_uid": r[0], "department_name": r[1] or r[0]}
+            for r in cur.fetchall()
+        ]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_fact_turnover_pg_options(search: str = "", limit: int = 50) -> list:
+    """Return distinct product groups from fact_turnover for filter dropdown (server-side search)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conds, params = ["(product_group_uid IS NOT NULL OR product_group_id IS NOT NULL)"], []
+        if search and search.strip():
+            conds.append(
+                "(product_group_name ILIKE %s OR product_group_uid ILIKE %s OR product_group_id ILIKE %s)"
+            )
+            s = f"%{search.strip()}%"
+            params += [s, s, s]
+        where = " AND ".join(conds)
+        cur.execute(
+            f"""SELECT DISTINCT product_group_id, product_group_uid, product_group_name
+                FROM fact_turnover
+                WHERE {where}
+                ORDER BY product_group_name
+                LIMIT %s""",
+            params + [min(limit, 200)],
+        )
+        return [
+            {
+                "product_group_id":   r[0],
+                "product_group_uid":  r[1],
+                "product_group_name": r[2] or r[1] or r[0],
+            }
+            for r in cur.fetchall()
+        ]
     finally:
         cur.close()
         conn.close()
@@ -1463,11 +1673,18 @@ def load_departments_to_staging(batch_id: int, rows: list, field_mapping: list) 
     return rows_loaded, rows_failed, rows_valid, rows_invalid
 
 
-def get_departments_staging_preview(batch_id: int, limit: int = 500,
-                                    status_filter: Optional[str] = None) -> dict:
+def get_departments_staging_preview(
+    batch_id: int,
+    limit: int = 100,
+    status_filter: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 100,
+    search: Optional[str] = None,
+) -> dict:
     conn = get_connection()
     cur = conn.cursor()
     try:
+        # Batch-level counters — always span all rows in this batch
         cur.execute(
             """SELECT COUNT(*),
                       COUNT(*) FILTER (WHERE validation_status = 'valid'),
@@ -1477,12 +1694,25 @@ def get_departments_staging_preview(batch_id: int, limit: int = 500,
         )
         agg = cur.fetchone()
 
-        where_extra = ""
-        params = [batch_id]
+        # Filtered WHERE for pagination
+        conds: list = ["batch_id = %s"]
+        params: list = [batch_id]
         if status_filter in ("valid", "invalid"):
-            where_extra = " AND validation_status = %s"
+            conds.append("validation_status = %s")
             params.append(status_filter)
-        params.append(limit)
+        if search and search.strip():
+            conds.append("(department_name ILIKE %s OR department_uid ILIKE %s"
+                         " OR organization_name ILIKE %s OR branch_name ILIKE %s"
+                         " OR region_name ILIKE %s)")
+            s = f"%{search.strip()}%"
+            params += [s, s, s, s, s]
+        where = " AND ".join(conds)
+
+        eff_page_size = min(max(page_size, 1), 500)
+        offset = (page - 1) * eff_page_size
+
+        cur.execute(f"SELECT COUNT(*) FROM staging_departments WHERE {where}", params)
+        filtered_total = int((cur.fetchone() or [0])[0])
 
         cur.execute(
             f"""SELECT id, department_uid, department_name, organization_name,
@@ -1491,17 +1721,21 @@ def get_departments_staging_preview(batch_id: int, limit: int = 500,
                        separated_department_uid, separated_department_name,
                        validation_status, validation_error, raw_row
                 FROM staging_departments
-                WHERE batch_id = %s{where_extra}
+                WHERE {where}
                 ORDER BY validation_status DESC, id
-                LIMIT %s""",
-            params,
+                LIMIT %s OFFSET %s""",
+            params + [eff_page_size, offset],
         )
         rows_data = cur.fetchall()
 
         return {
-            "total":   agg[0] or 0,
-            "valid":   agg[1] or 0,
-            "invalid": agg[2] or 0,
+            "total":          agg[0] or 0,
+            "valid":          agg[1] or 0,
+            "invalid":        agg[2] or 0,
+            "filtered_total": filtered_total,
+            "page":           page,
+            "page_size":      eff_page_size,
+            "total_pages":    max(1, (filtered_total + eff_page_size - 1) // eff_page_size),
             "rows": [
                 {
                     "id": r[0],
@@ -1703,6 +1937,46 @@ def commit_departments(batch_id: int) -> dict:
             if cur.rowcount > 0:
                 new_mappings += 1
 
+        # Auto-match pending rows via normalized UID:
+        # If another source already has a mapping for the same normalized UID
+        # (e.g. 0x8156... matches 1_0x8156... and 2_0x8156...) and all agree
+        # on a single master → automatically map this pending row too.
+        cur.execute(
+            """UPDATE department_source_mapping target
+               SET master_department_id = sub.master_id,
+                   mapping_status       = 'auto',
+                   confidence           = 90,
+                   mapping_method       = 'uid_auto_match',
+                   updated_at           = NOW()
+               FROM (
+                   SELECT t.source_id, t.source_department_id,
+                          MIN(e.master_department_id) AS master_id
+                   FROM department_source_mapping t
+                   JOIN department_source_mapping e
+                     ON (CASE WHEN e.source_department_id ~ '^[0-9]+_'
+                              THEN regexp_replace(e.source_department_id, '^[0-9]+_', '')
+                              ELSE e.source_department_id END)
+                      = (CASE WHEN t.source_department_id ~ '^[0-9]+_'
+                              THEN regexp_replace(t.source_department_id, '^[0-9]+_', '')
+                              ELSE t.source_department_id END)
+                     AND e.mapping_status IN ('mapped', 'auto')
+                     AND e.master_department_id IS NOT NULL
+                     AND NOT (e.source_id = t.source_id
+                              AND e.source_department_id = t.source_department_id)
+                   WHERE t.source_id = %s
+                     AND t.mapping_status = 'pending'
+                     AND t.master_department_id IS NULL
+                   GROUP BY t.source_id, t.source_department_id
+                   HAVING COUNT(DISTINCT e.master_department_id) = 1
+               ) sub
+               WHERE target.source_id = sub.source_id
+                 AND target.source_department_id = sub.source_department_id
+                 AND target.mapping_status = 'pending'
+                 AND target.master_department_id IS NULL""",
+            (source_id,),
+        )
+        auto_matched = cur.rowcount
+
         cur.execute(
             """UPDATE import_batches
                SET status = 'committed', finished_at = NOW(), rows_loaded_to_target = %s
@@ -1712,9 +1986,10 @@ def commit_departments(batch_id: int) -> dict:
 
         conn.commit()
         return {
-            "inserted":            inserted,
-            "updated":             updated,
-            "new_mappings":        new_mappings,
+            "inserted":             inserted,
+            "updated":              updated,
+            "new_mappings":         new_mappings,
+            "auto_matched_by_uid":  auto_matched,
             "changed_source_count": changed_source_count,
         }
     except Exception:
@@ -1805,8 +2080,14 @@ def load_brands_to_staging(batch_id: int, rows: list, field_mapping: list) -> tu
     return rows_loaded, rows_failed, rows_valid, rows_invalid
 
 
-def get_brands_staging_preview(batch_id: int, limit: int = 500,
-                               status_filter: Optional[str] = None) -> dict:
+def get_brands_staging_preview(
+    batch_id: int,
+    limit: int = 100,
+    status_filter: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 100,
+    search: Optional[str] = None,
+) -> dict:
     conn = get_connection()
     cur = conn.cursor()
     try:
@@ -1819,12 +2100,22 @@ def get_brands_staging_preview(batch_id: int, limit: int = 500,
         )
         agg = cur.fetchone()
 
-        where_extra = ""
-        params = [batch_id]
+        conds: list = ["batch_id = %s"]
+        params: list = [batch_id]
         if status_filter in ("valid", "invalid"):
-            where_extra = " AND validation_status = %s"
+            conds.append("validation_status = %s")
             params.append(status_filter)
-        params.append(limit)
+        if search and search.strip():
+            conds.append("(brand_name ILIKE %s OR brand_uid ILIKE %s OR brand_group ILIKE %s)")
+            s = f"%{search.strip()}%"
+            params += [s, s, s]
+        where = " AND ".join(conds)
+
+        eff_page_size = min(max(page_size, 1), 500)
+        offset = (page - 1) * eff_page_size
+
+        cur.execute(f"SELECT COUNT(*) FROM staging_brands WHERE {where}", params)
+        filtered_total = int((cur.fetchone() or [0])[0])
 
         cur.execute(
             f"""SELECT id, brand_uid, brand_name, brand_group,
@@ -1832,17 +2123,21 @@ def get_brands_staging_preview(batch_id: int, limit: int = 500,
                        source_level, source_company_name, source_is_active, source_brand_ref_id,
                        validation_status, validation_error, raw_row
                 FROM staging_brands
-                WHERE batch_id = %s{where_extra}
+                WHERE {where}
                 ORDER BY validation_status DESC, id
-                LIMIT %s""",
-            params,
+                LIMIT %s OFFSET %s""",
+            params + [eff_page_size, offset],
         )
         rows_data = cur.fetchall()
 
         return {
-            "total":   agg[0] or 0,
-            "valid":   agg[1] or 0,
-            "invalid": agg[2] or 0,
+            "total":          agg[0] or 0,
+            "valid":          agg[1] or 0,
+            "invalid":        agg[2] or 0,
+            "filtered_total": filtered_total,
+            "page":           page,
+            "page_size":      eff_page_size,
+            "total_pages":    max(1, (filtered_total + eff_page_size - 1) // eff_page_size),
             "rows": [
                 {
                     "id":                r[0],
@@ -2147,22 +2442,50 @@ def load_articles_to_staging(batch_id: int, rows: list, field_mapping: list):
         conn.close()
 
 
-def get_articles_staging_preview(batch_id: int, limit: int = 500, status_filter=None) -> dict:
+def get_articles_staging_preview(
+    batch_id: int,
+    limit: int = 100,
+    status_filter=None,
+    page: int = 1,
+    page_size: int = 100,
+    search: Optional[str] = None,
+) -> dict:
     conn = get_connection()
     cur = conn.cursor()
     try:
-        cond = "WHERE batch_id = %s"
-        params = [batch_id]
-        if status_filter:
-            cond += " AND validation_status = %s"
+        cur.execute(
+            """SELECT COUNT(*),
+                      COUNT(*) FILTER (WHERE validation_status = 'valid'),
+                      COUNT(*) FILTER (WHERE validation_status = 'invalid')
+               FROM staging_articles WHERE batch_id = %s""",
+            (batch_id,),
+        )
+        agg = cur.fetchone()
+
+        conds: list = ["batch_id = %s"]
+        params: list = [batch_id]
+        if status_filter in ("valid", "invalid"):
+            conds.append("validation_status = %s")
             params.append(status_filter)
+        if search and search.strip():
+            conds.append("(article_name ILIKE %s OR article_uid ILIKE %s OR pnl_code ILIKE %s)")
+            s = f"%{search.strip()}%"
+            params += [s, s, s]
+        where = " AND ".join(conds)
+
+        eff_page_size = min(max(page_size, 1), 500)
+        offset = (page - 1) * eff_page_size
+
+        cur.execute(f"SELECT COUNT(*) FROM staging_articles WHERE {where}", params)
+        filtered_total = int((cur.fetchone() or [0])[0])
 
         cur.execute(
             f"""SELECT id, article_uid, article_name, article_type,
                        level1, level2, pnl_code, expense_element, expense_company,
                        validation_status, validation_error, raw_row
-                FROM staging_articles {cond} ORDER BY id LIMIT %s""",
-            params + [limit],
+                FROM staging_articles WHERE {where} ORDER BY validation_status DESC, id
+                LIMIT %s OFFSET %s""",
+            params + [eff_page_size, offset],
         )
         rows = [
             {
@@ -2175,16 +2498,19 @@ def get_articles_staging_preview(batch_id: int, limit: int = 500, status_filter=
             for r in cur.fetchall()
         ]
 
-        cur.execute(
-            "SELECT COUNT(*) FROM staging_articles WHERE batch_id = %s", (batch_id,)
-        )
-        total = cur.fetchone()[0]
-        cur.execute(
-            "SELECT COUNT(*) FROM staging_articles WHERE batch_id = %s AND validation_status = 'valid'",
-            (batch_id,),
-        )
-        valid = cur.fetchone()[0]
-        return {"rows": rows, "total": total, "valid": valid, "invalid": total - valid}
+        total   = int(agg[0] or 0)
+        valid   = int(agg[1] or 0)
+        invalid = int(agg[2] or 0)
+        return {
+            "rows":           rows,
+            "total":          total,
+            "valid":          valid,
+            "invalid":        invalid,
+            "filtered_total": filtered_total,
+            "page":           page,
+            "page_size":      eff_page_size,
+            "total_pages":    max(1, (filtered_total + eff_page_size - 1) // eff_page_size),
+        }
     finally:
         cur.close()
         conn.close()
@@ -2230,18 +2556,56 @@ def commit_articles(batch_id: int) -> dict:
         staging_rows = cur.fetchall()
         inserted_source = updated_source = new_mappings = 0
 
+        _ART_TRACKED = ["source_article_name", "source_article_type",
+                        "source_level1", "source_level2",
+                        "expense_element", "expense_company"]
+
         for (art_uid, art_name, art_type, lv1, lv2, exp_elem, exp_comp) in staging_rows:
             source_article_id = (art_uid or "").strip() or (art_name or "").strip()
             if not source_article_id:
                 continue
+
+            new_vals = {
+                "source_article_name": (art_name  or "").strip(),
+                "source_article_type": (art_type  or "").strip(),
+                "source_level1":       (lv1       or "").strip(),
+                "source_level2":       (lv2       or "").strip(),
+                "expense_element":     (exp_elem  or "").strip(),
+                "expense_company":     (exp_comp  or "").strip(),
+            }
+
+            # Read existing row to detect changes
+            cur.execute(
+                """SELECT source_article_name, source_article_type,
+                          source_level1, source_level2,
+                          expense_element, expense_company
+                   FROM dim_article_source
+                   WHERE source_id = %s AND source_article_id = %s""",
+                (source_id, source_article_id),
+            )
+            existing = cur.fetchone()
+            is_new = existing is None
+
+            changed_fields_dict = {}
+            if existing:
+                old_vals = dict(zip(_ART_TRACKED, (v or "" for v in existing)))
+                for field in _ART_TRACKED:
+                    if old_vals[field] != new_vals[field]:
+                        changed_fields_dict[field] = {
+                            "old": old_vals[field],
+                            "new": new_vals[field],
+                        }
+            is_changed = bool(changed_fields_dict)
+            changed_fields_json = json.dumps(changed_fields_dict, ensure_ascii=False) if is_changed else None
 
             # Upsert descriptive fields into dim_article_source
             cur.execute(
                 """INSERT INTO dim_article_source
                        (source_id, source_name, source_article_id, source_article_name,
                         source_article_type, source_level1, source_level2,
-                        expense_element, expense_company, loaded_at, is_active)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),TRUE)
+                        expense_element, expense_company, loaded_at, is_active,
+                        source_changed, changed_fields)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),TRUE, FALSE, NULL)
                    ON CONFLICT (source_id, source_article_id) DO UPDATE SET
                        source_name         = EXCLUDED.source_name,
                        source_article_name = EXCLUDED.source_article_name,
@@ -2251,11 +2615,18 @@ def commit_articles(batch_id: int) -> dict:
                        expense_element     = EXCLUDED.expense_element,
                        expense_company     = EXCLUDED.expense_company,
                        loaded_at           = NOW(),
-                       is_active           = TRUE
+                       is_active           = TRUE,
+                       source_changed      = %s,
+                       changed_fields      = CASE WHEN %s
+                                                  THEN %s::jsonb
+                                                  ELSE dim_article_source.changed_fields END
                    RETURNING (xmax = 0) AS is_insert""",
                 (source_id, source_name, source_article_id,
-                 art_name or "", art_type or "", lv1 or "", lv2 or "",
-                 exp_elem or "", exp_comp or ""),
+                 new_vals["source_article_name"], new_vals["source_article_type"],
+                 new_vals["source_level1"], new_vals["source_level2"],
+                 new_vals["expense_element"], new_vals["expense_company"],
+                 is_changed,
+                 is_changed, changed_fields_json),
             )
             row = cur.fetchone()
             if row and row[0]:
@@ -2334,17 +2705,36 @@ def universal_load_to_staging(
 def universal_get_staging_preview(
     batch_id: int,
     import_type_code: str,
-    limit: int = 500,
+    limit: int = 100,
     status_filter: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 100,
+    search: Optional[str] = None,
+    period_month: Optional[str] = None,
+    department_search: Optional[str] = None,
+    product_group_search: Optional[str] = None,
 ) -> dict:
     if import_type_code == "departments":
-        return get_departments_staging_preview(batch_id, limit=limit, status_filter=status_filter)
+        return get_departments_staging_preview(
+            batch_id, status_filter=status_filter,
+            page=page, page_size=page_size, search=search,
+        )
     elif import_type_code == "brands":
-        return get_brands_staging_preview(batch_id, limit=limit, status_filter=status_filter)
+        return get_brands_staging_preview(
+            batch_id, status_filter=status_filter,
+            page=page, page_size=page_size, search=search,
+        )
     elif import_type_code == "articles":
-        return get_articles_staging_preview(batch_id, limit=limit, status_filter=status_filter)
+        return get_articles_staging_preview(
+            batch_id, status_filter=status_filter,
+            page=page, page_size=page_size, search=search,
+        )
     else:
-        return get_staging_preview(batch_id, limit=limit, status_filter=status_filter)
+        return get_staging_preview(
+            batch_id, limit=limit, status_filter=status_filter,
+            page=page, page_size=page_size, search=search, period_month=period_month,
+            department_search=department_search, product_group_search=product_group_search,
+        )
 
 
 def universal_commit(

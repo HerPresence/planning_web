@@ -25,6 +25,8 @@ from services.import_engine import (
     get_batch,
     get_batches,
     get_fact_turnover as svc_get_fact_turnover,
+    get_fact_turnover_dept_options as svc_ft_dept_options,
+    get_fact_turnover_pg_options   as svc_ft_pg_options,
     get_field_mapping,
     get_staging_preview,
     load_sales_fact_to_staging,
@@ -286,8 +288,7 @@ def load_to_staging(
                      finished_at=datetime.now())
         raise HTTPException(500, f"Error writing to staging: {exc}")
 
-    preview_limit = 5000 if import_type_code in ("departments", "brands") else 500
-    staging = universal_get_staging_preview(batch_id, import_type_code, limit=preview_limit)
+    staging = universal_get_staging_preview(batch_id, import_type_code, page=1, page_size=100)
     return {
         "batch_id": batch_id,
         "rows_total": len(raw_rows),
@@ -305,13 +306,28 @@ def load_to_staging(
 # ---- Staging preview --------------------------------------------------------
 
 @router.get("/staging/{batch_id}")
-def staging_preview(batch_id: int, status_filter: Optional[str] = None,
-                    limit: int = 500, _u=Depends(get_current_user)):
+def staging_preview(
+    batch_id: int,
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+    page: int = 1,
+    page_size: int = 100,
+    search: Optional[str] = None,
+    period_month: Optional[str] = None,
+    department_search:    Optional[str] = None,
+    product_group_search: Optional[str] = None,
+    _u=Depends(get_current_user),
+):
     batch = get_batch(batch_id)
     if not batch:
         raise HTTPException(404, "Batch not found")
     return universal_get_staging_preview(
-        batch_id, batch["import_type_code"], limit=limit, status_filter=status_filter
+        batch_id, batch["import_type_code"],
+        limit=limit, status_filter=status_filter,
+        page=page, page_size=page_size,
+        search=search, period_month=period_month,
+        department_search=department_search,
+        product_group_search=product_group_search,
     )
 
 
@@ -464,6 +480,28 @@ def rollback_batch_endpoint(batch_id: int, _u=Depends(get_current_user)):
     return {"ok": True, **result}
 
 
+# ---- Fact Turnover filter options (must be before /fact-turnover) -----------
+
+@router.get("/fact-turnover/filter-options/departments")
+def ft_dept_options(
+    search: str = "",
+    limit:  int = 50,
+    _u=Depends(get_current_user),
+):
+    """Server-side department list for searchable dropdown."""
+    return svc_ft_dept_options(search=search, limit=limit)
+
+
+@router.get("/fact-turnover/filter-options/product-groups")
+def ft_pg_options(
+    search: str = "",
+    limit:  int = 50,
+    _u=Depends(get_current_user),
+):
+    """Server-side product-group list for searchable dropdown."""
+    return svc_ft_pg_options(search=search, limit=limit)
+
+
 # ---- Fact Turnover view -----------------------------------------------------
 
 @router.get("/fact-turnover")
@@ -471,14 +509,20 @@ def get_fact_turnover(
     period_from:       Optional[str] = None,
     period_to:         Optional[str] = None,
     source_id:         Optional[int] = None,
-    limit:             int = 5000,
+    department_uid:    Optional[str] = None,
+    product_group_uid: Optional[str] = None,
+    page:              int = 1,
+    page_size:         int = 100,
     _u=Depends(get_current_user),
 ):
     return svc_get_fact_turnover(
         period_from=period_from,
         period_to=period_to,
         source_id=source_id,
-        limit=limit,
+        department_uid=department_uid,
+        product_group_uid=product_group_uid,
+        page=page,
+        page_size=page_size,
     )
 
 

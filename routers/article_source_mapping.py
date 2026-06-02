@@ -92,6 +92,8 @@ def _ensure_staging_default_columns():
             ("default_master_level1",       "TEXT"),
             ("default_master_level2",       "TEXT"),
             ("default_master_article_name", "TEXT"),
+            ("source_changed",              "BOOLEAN DEFAULT FALSE"),
+            ("changed_fields",              "JSONB"),
         ]:
             cur.execute(
                 f"ALTER TABLE dim_article_source ADD COLUMN IF NOT EXISTS {col} {typ}"
@@ -159,15 +161,20 @@ def _build_bulk_base_where(f: BulkFillFilters):
 
 @router.get("/staged")
 def get_staged_articles(
-    source_id:        Optional[int] = None,
-    company:          Optional[str] = None,
-    mapping_status:   Optional[str] = None,
-    search:           Optional[str] = None,
-    level1:           Optional[str] = None,
-    level2:           Optional[str] = None,
-    master_level1:    Optional[str] = None,
-    master_level2:    Optional[str] = None,
-    pnl_structure_id: Optional[int] = None,
+    source_id:        Optional[int]   = None,
+    company:          Optional[str]   = None,
+    mapping_status:   Optional[str]   = None,
+    search:           Optional[str]   = None,
+    level1:           Optional[str]   = None,
+    level2:           Optional[str]   = None,
+    master_level1:    Optional[str]   = None,
+    master_level2:    Optional[str]   = None,
+    pnl_structure_id: Optional[int]   = None,
+    only_unmapped:    bool            = False,
+    source_changed:   bool            = False,
+    recommendation:   Optional[str]   = None,
+    amount_min:       Optional[float] = None,
+    amount_max:       Optional[float] = None,
     page:             int = 1,
     page_size:        int = 50,
 ):
@@ -235,6 +242,30 @@ def get_staged_articles(
                 full_where.append("asm.mapping_status = %s")
                 full_params.append(mapping_status)
 
+        # Advanced filters (applied only to full_where, not KPI base_where)
+        if only_unmapped:
+            full_where.append("(asm.mapping_status IS NULL OR asm.mapping_status = 'pending')")
+        if source_changed:
+            full_where.append("das.source_changed = TRUE")
+        if amount_min is not None:
+            full_where.append(
+                "(SELECT COALESCE(SUM(ABS(fp2.amount)),0) FROM fact_pnl fp2 "
+                " WHERE CASE WHEN asm.master_article_id IS NOT NULL "
+                "            THEN fp2.article_id = asm.master_article_id "
+                "            ELSE LOWER(fp2.article_name) = LOWER(das.source_article_name) END"
+                ") >= %s"
+            )
+            full_params.append(amount_min)
+        if amount_max is not None:
+            full_where.append(
+                "(SELECT COALESCE(SUM(ABS(fp2.amount)),0) FROM fact_pnl fp2 "
+                " WHERE CASE WHEN asm.master_article_id IS NOT NULL "
+                "            THEN fp2.article_id = asm.master_article_id "
+                "            ELSE LOWER(fp2.article_name) = LOWER(das.source_article_name) END"
+                ") <= %s"
+            )
+            full_params.append(amount_max)
+
         base_sql = " AND ".join(base_where)
         full_sql = " AND ".join(full_where)
 
@@ -245,7 +276,11 @@ def get_staged_articles(
                 COUNT(*),
                 COUNT(*) FILTER (WHERE asm.mapping_status IS NULL OR asm.mapping_status = 'pending'),
                 COUNT(*) FILTER (WHERE asm.mapping_status IN ('mapped', 'auto')),
-                COUNT(*) FILTER (WHERE asm.mapping_status = 'rejected')
+                COUNT(*) FILTER (WHERE asm.mapping_status = 'mapped'),
+                COUNT(*) FILTER (WHERE asm.mapping_status = 'auto'),
+                COUNT(*) FILTER (WHERE asm.mapping_status = 'rejected'),
+                COUNT(*) FILTER (WHERE das.source_changed = TRUE),
+                COUNT(*) FILTER (WHERE das.is_active = FALSE)
             {join_sql}
             WHERE {base_sql}
             """,
@@ -253,10 +288,14 @@ def get_staged_articles(
         )
         kpi_row = cur.fetchone()
         kpi = {
-            "total":    int(kpi_row[0]),
-            "pending":  int(kpi_row[1]),
-            "mapped":   int(kpi_row[2]),
-            "rejected": int(kpi_row[3]),
+            "total":          int(kpi_row[0]),
+            "pending":        int(kpi_row[1]),
+            "mapped":         int(kpi_row[2]),
+            "mapped_manual":  int(kpi_row[3]),
+            "auto":           int(kpi_row[4]),
+            "rejected":       int(kpi_row[5]),
+            "source_changed": int(kpi_row[6]),
+            "inactive":       int(kpi_row[7]),
         }
 
         # Base context for filter value queries: source/company/search only
@@ -382,7 +421,15 @@ def get_staged_articles(
                 das.default_master_article_name,
                 COALESCE(ps.id,       ps2.id)       AS pnl_structure_id,
                 COALESCE(ps.pnl_code, ps2.pnl_code) AS pnl_structure_code,
-                COALESCE(ps.pnl_name, ps2.pnl_name) AS pnl_structure_name
+                COALESCE(ps.pnl_name, ps2.pnl_name) AS pnl_structure_name,
+                (SELECT COALESCE(SUM(ABS(fp.amount)), 0)
+                 FROM fact_pnl fp
+                 WHERE CASE
+                    WHEN asm.master_article_id IS NOT NULL
+                    THEN fp.article_id = asm.master_article_id
+                    ELSE LOWER(fp.article_name) = LOWER(das.source_article_name)
+                 END
+                ) AS amount_impact
             {join_sql}
             WHERE {full_sql}
             ORDER BY das.expense_company, das.source_article_id
@@ -424,9 +471,32 @@ def get_staged_articles(
                 "pnl_structure_id":            r[27],
                 "pnl_structure_code":          r[28],
                 "pnl_structure_name":          r[29],
+                "amount_impact":               float(r[30]) if r[30] else None,
             }
             for r in rows
         ]
+
+        # Attach recommendations for pending rows
+        try:
+            from services.article_recommendation import recommend_master
+            cur.execute(
+                "SELECT article_id, article_name, level1, level2, "
+                "       uid_expense_article, article_type, pnl_id "
+                "FROM dim_article WHERE is_active = TRUE"
+            )
+            masters_for_rec = [
+                {"article_id": r[0], "article_name": r[1], "level1": r[2],
+                 "level2": r[3], "uid_expense_article": r[4],
+                 "article_type": r[5], "pnl_id": r[6]}
+                for r in cur.fetchall()
+            ]
+            for row in result:
+                if row["mapping_status"] in ("pending", None) and not row["master_article_id"]:
+                    row["suggestion"] = recommend_master(row, masters_for_rec)
+                else:
+                    row["suggestion"] = None
+        except Exception:
+            pass  # recommendations are non-critical
 
         return {
             "status":    "ok",
@@ -457,7 +527,8 @@ def get_master_articles():
     cur  = conn.cursor()
     try:
         cur.execute(
-            "SELECT article_id, article_name, level1, level2, uid_expense_article "
+            "SELECT article_id, article_name, level1, level2, uid_expense_article, "
+            "       article_type, pnl_id "
             "FROM dim_article WHERE is_active = TRUE ORDER BY article_id"
         )
         rows = cur.fetchall()
@@ -468,6 +539,8 @@ def get_master_articles():
                 "level1":              r[2],
                 "level2":              r[3],
                 "uid_expense_article": r[4],
+                "article_type":        r[5],
+                "pnl_id":              r[6],
             }
             for r in rows
         ]
@@ -978,6 +1051,138 @@ def bulk_create(req: BulkCreateRequest):
 
 
 # ── delete mapping ────────────────────────────────────────────────────────────
+
+@router.get("/coverage")
+def get_article_coverage(source_id: Optional[int] = None):
+    """
+    Article mapping coverage stats linked to fact_pnl amounts.
+    - Source article counts from dim_article_source + article_source_mapping
+    - Amounts from fact_pnl via master_article_id for mapped articles
+    - Top unmapped by name-match amount estimate
+    """
+    ensure_source_staging_tables()
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        src_filter    = "AND das.source_id = %s" if source_id else ""
+        src_params    = [source_id] if source_id else []
+
+        # Source article counts
+        cur.execute(
+            f"""
+            SELECT
+                COUNT(*)                                                                      AS total,
+                COUNT(*) FILTER (WHERE asm.mapping_status IN ('mapped','auto'))               AS mapped,
+                COUNT(*) FILTER (WHERE asm.mapping_status IS NULL
+                                    OR asm.mapping_status = 'pending')                        AS unmapped,
+                COUNT(*) FILTER (WHERE asm.mapping_status = 'auto')                           AS auto_mapped,
+                COUNT(*) FILTER (WHERE asm.mapping_status = 'rejected')                       AS rejected
+            FROM dim_article_source das
+            LEFT JOIN article_source_mapping asm
+                   ON asm.source_id = das.source_id
+                  AND asm.source_article_id = das.source_article_id
+            WHERE das.is_active = TRUE {src_filter}
+            """,
+            src_params,
+        )
+        r = cur.fetchone()
+        total, mapped, unmapped, auto_mapped, rejected = (int(x or 0) for x in r)
+        coverage_pct = round(mapped / total * 100, 1) if total else 0
+
+        # Sum of fact_pnl amounts for mapped articles
+        cur.execute(
+            f"""
+            SELECT COALESCE(SUM(ABS(fp.amount)), 0)
+            FROM fact_pnl fp
+            WHERE fp.article_id IN (
+                SELECT asm.master_article_id
+                FROM dim_article_source das
+                JOIN article_source_mapping asm
+                  ON asm.source_id = das.source_id
+                 AND asm.source_article_id = das.source_article_id
+                WHERE das.is_active = TRUE
+                  AND asm.mapping_status IN ('mapped','auto')
+                  AND asm.master_article_id IS NOT NULL
+                  {src_filter}
+            )
+            """,
+            src_params,
+        )
+        sum_amount_mapped = float(cur.fetchone()[0])
+
+        # Sum of fact_pnl amounts for UNmapped — by article_name text match
+        cur.execute(
+            f"""
+            SELECT COALESCE(SUM(ABS(fp.amount)), 0)
+            FROM fact_pnl fp
+            WHERE LOWER(fp.article_name) IN (
+                SELECT LOWER(das.source_article_name)
+                FROM dim_article_source das
+                LEFT JOIN article_source_mapping asm
+                       ON asm.source_id = das.source_id
+                      AND asm.source_article_id = das.source_article_id
+                WHERE das.is_active = TRUE
+                  AND (asm.mapping_status IS NULL OR asm.mapping_status = 'pending')
+                  {src_filter}
+            )
+            """,
+            src_params,
+        )
+        sum_amount_unmapped = float(cur.fetchone()[0])
+
+        # Top-10 unmapped by estimated amount (name match in fact_pnl)
+        cur.execute(
+            f"""
+            SELECT
+                das.source_id,
+                das.source_article_id,
+                das.source_article_name,
+                das.expense_company,
+                COALESCE(das.level1_olap, das.source_level1)    AS level1,
+                COALESCE(SUM(ABS(fp.amount)), 0)                AS amount_estimate
+            FROM dim_article_source das
+            LEFT JOIN article_source_mapping asm
+                   ON asm.source_id = das.source_id
+                  AND asm.source_article_id = das.source_article_id
+            LEFT JOIN fact_pnl fp
+                   ON LOWER(fp.article_name) = LOWER(das.source_article_name)
+            WHERE das.is_active = TRUE
+              AND (asm.mapping_status IS NULL OR asm.mapping_status = 'pending')
+              {src_filter}
+            GROUP BY das.source_id, das.source_article_id, das.source_article_name,
+                     das.expense_company, das.level1_olap, das.source_level1
+            ORDER BY amount_estimate DESC
+            LIMIT 10
+            """,
+            src_params,
+        )
+        top_unmapped = [
+            {
+                "source_id":           r[0],
+                "source_article_id":   r[1],
+                "source_article_name": r[2],
+                "company":             r[3],
+                "level1":              r[4],
+                "amount_estimate":     float(r[5]),
+            }
+            for r in cur.fetchall()
+        ]
+
+        return {
+            "total_source_articles": total,
+            "mapped_articles":       mapped,
+            "unmapped_articles":     unmapped,
+            "auto_mapped":           auto_mapped,
+            "rejected":              rejected,
+            "coverage_pct":          coverage_pct,
+            "sum_amount_mapped":     sum_amount_mapped,
+            "sum_amount_unmapped":   sum_amount_unmapped,
+            "top_unmapped":          top_unmapped,
+        }
+    finally:
+        cur.close()
+        conn.close()
+
 
 @router.delete("/bind/{source_id}/{source_article_id}")
 def delete_bind(source_id: int, source_article_id: str):
