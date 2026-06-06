@@ -84,6 +84,9 @@ SALES_FACT_DEFAULT_FIELDS = [
     {"source_field": "NGV UIDNomenklaturnaGrupaVytrat",     "target_field": "product_group_uid", "required": True},
     {"source_field": "NGV NomenklaturnaGrupaVytrat",        "target_field": "product_group_name","required": True},
     {"source_field": "Kalendar Pochatok misiatsia",         "target_field": "period_month",      "required": True},
+    {"source_field": "Nomenklatura UIDNomenklatura",        "target_field": "sku_uid",           "required": False},
+    {"source_field": "Nomenklatura Nomenklatura",           "target_field": "sku_name",          "required": False},
+    {"source_field": "Nomenklatura IDNomenklatura",         "target_field": "source_sku_uid",    "required": False},
     {"source_field": "Prodazhi hrn z PDV",                  "target_field": "sales_vat",         "required": False},
     {"source_field": "Prodazhi hrn rozdribni",              "target_field": "sales_retail",      "required": False},
     {"source_field": "Aksyz hrn",                           "target_field": "excise",            "required": False},
@@ -117,6 +120,7 @@ CANONICAL_STAGING_FIELDS: dict[str, frozenset] = {
         "department_uid", "department_name", "product_group_id",
         "product_group_uid", "product_group_name", "period_month",
         "sales_vat", "sales_retail", "excise", "sales_dal", "sales_kg",
+        "sku_uid", "sku_name", "source_sku_uid",
     }),
 }
 
@@ -293,6 +297,19 @@ def ensure_import_engine_tables():
             "ALTER COLUMN master_department_id TYPE TEXT USING master_department_id::text"
         )
 
+        # SKU columns for staging_sales_fact (nullable, backward-compatible)
+        for _col in [
+            "sku_uid        TEXT",
+            "sku_name       TEXT",
+            "source_sku_uid TEXT",
+        ]:
+            cur.execute(
+                f"ALTER TABLE staging_sales_fact ADD COLUMN IF NOT EXISTS {_col}"
+            )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_staging_sf_sku_uid ON staging_sales_fact (sku_uid)"
+        )
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sf_bulk_update_log (
                 id             SERIAL PRIMARY KEY,
@@ -430,6 +447,17 @@ def ensure_import_engine_tables():
                 UNIQUE (source_id, source_brand_id)
             )
         """)
+        # Migrate existing brand_source_mapping tables that may lack newer columns
+        for _migrate_sql in (
+            "ALTER TABLE brand_source_mapping ADD COLUMN IF NOT EXISTS master_brand_id  INTEGER",
+            "ALTER TABLE brand_source_mapping ADD COLUMN IF NOT EXISTS mapping_status   TEXT DEFAULT 'pending'",
+            "ALTER TABLE brand_source_mapping ADD COLUMN IF NOT EXISTS confidence       NUMERIC(5,2) DEFAULT 0",
+            "ALTER TABLE brand_source_mapping ADD COLUMN IF NOT EXISTS mapped_by        INTEGER",
+            "ALTER TABLE brand_source_mapping ADD COLUMN IF NOT EXISTS updated_at       TIMESTAMP DEFAULT NOW()",
+        ):
+            try: cur.execute(_migrate_sql); conn.commit()
+            except Exception: conn.rollback()
+
         for _idx_sql in (
             "CREATE INDEX IF NOT EXISTS idx_dbs_source_id        ON dim_brand_source(source_id)",
             "CREATE INDEX IF NOT EXISTS idx_dbs_source_brand_id  ON dim_brand_source(source_brand_id)",
@@ -551,6 +579,65 @@ def ensure_import_engine_tables():
                 UNIQUE (period_month, department_uid, product_group_uid, source_id)
             )
         """)
+
+        # SKU columns for fact_turnover (nullable, backward-compatible)
+        for _col in [
+            "sku_uid        TEXT",
+            "sku_name       TEXT",
+            "source_sku_uid TEXT",
+        ]:
+            cur.execute(
+                f"ALTER TABLE fact_turnover ADD COLUMN IF NOT EXISTS {_col}"
+            )
+
+        # Replace the inline UNIQUE(period, dept, pg, source) table constraint with two
+        # partial unique indexes so SKU-level and non-SKU imports each get the correct
+        # conflict target.  The DO block finds the constraint by column count + period_month
+        # membership (robust against auto-generated names).  Idempotent: if already dropped,
+        # the SELECT returns NULL and EXECUTE is skipped.
+        try:
+            cur.execute("""
+                DO $$
+                DECLARE v_name TEXT;
+                BEGIN
+                    SELECT conname INTO v_name
+                    FROM pg_constraint c
+                    WHERE c.conrelid = 'fact_turnover'::regclass
+                      AND c.contype = 'u'
+                      AND array_length(c.conkey, 1) = 4
+                      AND EXISTS (
+                          SELECT 1 FROM pg_attribute a
+                          WHERE a.attrelid = c.conrelid
+                            AND a.attnum = ANY(c.conkey)
+                            AND a.attname = 'period_month'
+                      )
+                    LIMIT 1;
+                    IF v_name IS NOT NULL THEN
+                        EXECUTE 'ALTER TABLE fact_turnover DROP CONSTRAINT '
+                                || quote_ident(v_name);
+                    END IF;
+                END $$
+            """)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+
+        for _idx_sql in [
+            # Non-SKU imports: old four-column uniqueness (sku_uid IS NULL rows only)
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_ft_no_sku ON fact_turnover
+               (period_month, department_uid, product_group_uid, source_id)
+               WHERE sku_uid IS NULL""",
+            # SKU imports: five-column uniqueness (sku_uid IS NOT NULL rows only)
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_ft_with_sku ON fact_turnover
+               (period_month, department_uid, product_group_uid, source_id, sku_uid)
+               WHERE sku_uid IS NOT NULL""",
+            "CREATE INDEX IF NOT EXISTS idx_ft_sku_uid ON fact_turnover (sku_uid)",
+        ]:
+            try:
+                cur.execute(_idx_sql)
+                conn.commit()
+            except Exception:
+                conn.rollback()
 
         conn.commit()
         print("[startup] ensure_import_engine_tables: done")
@@ -869,6 +956,9 @@ def load_sales_fact_to_staging(
             pg_id     = str(mapped.get("product_group_id") or "").strip()
             pg_uid    = str(mapped.get("product_group_uid") or "").strip()
             pg_name   = str(mapped.get("product_group_name") or "").strip()
+            sku_uid        = str(mapped.get("sku_uid") or "").strip() or None
+            sku_name       = str(mapped.get("sku_name") or "").strip() or None
+            source_sku_uid = str(mapped.get("source_sku_uid") or "").strip() or None
 
             if not dept_uid:
                 errors.append("Empty department_uid")
@@ -904,10 +994,12 @@ def load_sales_fact_to_staging(
                     """INSERT INTO staging_sales_fact
                        (batch_id, period_month, department_uid, department_name,
                         product_group_id, product_group_uid, product_group_name,
+                        sku_uid, sku_name, source_sku_uid,
                         sales_vat, sales_retail, excise, sales_dal, sales_kg,
                         raw_row, extra_fields, validation_status, validation_error)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)""",
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s)""",
                     (batch_id, period, dept_uid, dept_name, pg_id, pg_uid, pg_name,
+                     sku_uid, sku_name, source_sku_uid,
                      sales_vat, sales_retail, excise, sales_dal, sales_kg,
                      raw_json, extra_json, v_status, v_error),
                 )
@@ -1003,7 +1095,8 @@ def get_staging_preview(
                        validation_status, validation_error, raw_row,
                        master_department_id, master_department_name,
                        master_brand_id, master_brand_name, master_brand_uid,
-                       mapping_status
+                       mapping_status,
+                       sku_uid, sku_name, source_sku_uid
                 FROM staging_sales_fact
                 WHERE {where}
                 ORDER BY validation_status DESC, id
@@ -1033,6 +1126,9 @@ def get_staging_preview(
                 "master_brand_name":      r[17],
                 "master_brand_uid":       r[18],
                 "mapping_status":         r[19] or "not_set",
+                "sku_uid":        r[20],
+                "sku_name":       r[21],
+                "source_sku_uid": r[22],
             })
 
         total   = int(agg[0])
@@ -1099,33 +1195,73 @@ def commit_sales_fact(batch_id: int, source_id: int,
                 )
                 deleted_from_target = cur.rowcount
 
+        # Pre-commit: warn if the batch has within-batch duplicate SKU keys
         cur.execute(
-            """INSERT INTO fact_turnover
+            """SELECT COUNT(*) FROM (
+                   SELECT period_month, department_uid, product_group_uid, sku_uid
+                   FROM staging_sales_fact
+                   WHERE batch_id = %s AND validation_status = 'valid'
+                     AND sku_uid IS NOT NULL
+                   GROUP BY period_month, department_uid, product_group_uid, sku_uid
+                   HAVING COUNT(*) > 1
+               ) dups""",
+            (batch_id,),
+        )
+        dup_count = int(cur.fetchone()[0])
+        if dup_count:
+            print(f"[commit] WARNING: {dup_count} duplicate (period, dept, pg, sku_uid) "
+                  f"combos in batch {batch_id} — last row per group will win")
+
+        _INSERT_COLS = """
                (period_month, department_uid, department_name,
                 product_group_id, product_group_uid, product_group_name,
+                sku_uid, sku_name, source_sku_uid,
                 sales_vat, sales_retail, excise, sales_dal, sales_kg,
-                source_id, batch_id)
+                source_id, batch_id)"""
+        _SELECT_COLS = """
                SELECT period_month, department_uid, department_name,
                       product_group_id, product_group_uid, product_group_name,
+                      sku_uid, sku_name, source_sku_uid,
                       sales_vat, sales_retail, excise, sales_dal, sales_kg,
                       %s, batch_id
                FROM staging_sales_fact
-               WHERE batch_id = %s AND validation_status = 'valid'
-               ON CONFLICT (period_month, department_uid, product_group_uid, source_id)
+               WHERE batch_id = %s AND validation_status = 'valid'"""
+        _UPDATE_SET = """
                DO UPDATE SET
                    department_name    = EXCLUDED.department_name,
                    product_group_id   = EXCLUDED.product_group_id,
                    product_group_name = EXCLUDED.product_group_name,
+                   sku_name           = EXCLUDED.sku_name,
+                   source_sku_uid     = EXCLUDED.source_sku_uid,
                    sales_vat          = EXCLUDED.sales_vat,
                    sales_retail       = EXCLUDED.sales_retail,
                    excise             = EXCLUDED.excise,
                    sales_dal          = EXCLUDED.sales_dal,
                    sales_kg           = EXCLUDED.sales_kg,
                    batch_id           = EXCLUDED.batch_id,
-                   created_at         = NOW()""",
+                   created_at         = NOW()"""
+
+        # SKU rows: unique on (period, dept, pg, source, sku_uid) WHERE sku_uid IS NOT NULL
+        cur.execute(
+            f"INSERT INTO fact_turnover {_INSERT_COLS}"
+            f"{_SELECT_COLS} AND sku_uid IS NOT NULL\n"
+            f"               ON CONFLICT (period_month, department_uid, product_group_uid,"
+            f" source_id, sku_uid) WHERE sku_uid IS NOT NULL\n"
+            f"{_UPDATE_SET}",
             (source_id, batch_id),
         )
         committed = cur.rowcount
+
+        # Non-SKU rows: unique on (period, dept, pg, source) WHERE sku_uid IS NULL
+        cur.execute(
+            f"INSERT INTO fact_turnover {_INSERT_COLS}"
+            f"{_SELECT_COLS} AND sku_uid IS NULL\n"
+            f"               ON CONFLICT (period_month, department_uid, product_group_uid,"
+            f" source_id) WHERE sku_uid IS NULL\n"
+            f"{_UPDATE_SET}",
+            (source_id, batch_id),
+        )
+        committed += cur.rowcount
 
         # Insert any new (source_id, dept_uid) pairs into department_source_mapping as pending
         cur.execute(

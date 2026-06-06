@@ -107,7 +107,7 @@ def migrate_pnl_levels_from_articles() -> None:
         cur.execute(
             """
             INSERT INTO dim_pnl_level1 (level2_id, name, is_active)
-            SELECT l2.id, TRIM(da.level1), TRUE
+            SELECT l2.id, da.l1name, TRUE
             FROM (
                 SELECT DISTINCT TRIM(level2) AS l2name, TRIM(level1) AS l1name
                 FROM dim_article

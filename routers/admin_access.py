@@ -31,7 +31,8 @@ MENU_ITEMS_SEED = [
     ("pnlImport",     "Імпорт PnL",       "planning",    "pnlImport",     15),
     ("importData",    "Імпорт даних",     "planning",    "importData",    16),
     ("factTurnover",  "Факт продажів",    "planning",    "factTurnover",  17),
-    ("budgets",       "Бюджети витрат",   "planning",    "budgets",       18),
+    ("planningSales", "Планування продажів", "planning", "planningSales", 18),
+    ("budgets",       "Бюджети витрат",   "planning",    "budgets",       19),
     ("users",         "Користувачі",      "admin",       "users",         17),
     ("roles",         "Ролі",             "admin",       "roles",         18),
     ("permissions",   "Права доступу",    "admin",       "permissions",   19),
@@ -195,6 +196,10 @@ def ensure_admin_tables() -> None:
         cur.execute(
             "UPDATE menu_items SET sort_order = 18 WHERE menu_key = 'budgets' AND sort_order = 17"
         )
+        # Shift budgets to 19 to make room for planningSales at 18
+        cur.execute(
+            "UPDATE menu_items SET sort_order = 19 WHERE menu_key = 'budgets' AND sort_order = 18"
+        )
 
         # Seed Admin role
         cur.execute("""
@@ -229,6 +234,23 @@ def ensure_admin_tables() -> None:
                 cur.execute("""
                     INSERT INTO role_permissions (role_id, menu_key, can_view, can_edit, can_create)
                     VALUES (%s, 'factTurnover', %s, %s, %s)
+                    ON CONFLICT (role_id, menu_key) DO NOTHING
+                """, (rrow[0], can_view, can_edit, can_create))
+
+        # Seed planningSales permissions for standard non-admin roles (if those roles exist)
+        # DO NOTHING — never overwrite manually-set permissions
+        _planning_sales_role_perms = [
+            ("CFO",                  True,  True,  True),
+            ("Business Controller",  True,  False, False),
+            ("Viewer",               True,  False, False),
+        ]
+        for role_name, can_view, can_edit, can_create in _planning_sales_role_perms:
+            cur.execute("SELECT id FROM roles WHERE role_name = %s", (role_name,))
+            rrow = cur.fetchone()
+            if rrow:
+                cur.execute("""
+                    INSERT INTO role_permissions (role_id, menu_key, can_view, can_edit, can_create)
+                    VALUES (%s, 'planningSales', %s, %s, %s)
                     ON CONFLICT (role_id, menu_key) DO NOTHING
                 """, (rrow[0], can_view, can_edit, can_create))
 

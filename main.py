@@ -1,6 +1,16 @@
+import logging
 import os
+import sys
+import time
 
-from fastapi import FastAPI
+print("=" * 50)
+print("METRICORE_BACKEND_ACTIVE")
+print("cwd =", os.getcwd())
+print("pid =", os.getpid())
+print("python =", sys.executable)
+print("=" * 50)
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -43,8 +53,23 @@ from services.article_import_service import (
 )
 from routers.planning import router as planning_router
 from services.planning_engine import ensure_planning_tables
+from routers.system_info import router as system_info_router
 
 app = FastAPI(title="Planning Web")
+
+_req_logger = logging.getLogger("request")
+
+
+@app.middleware("http")
+async def log_all_requests(request: Request, call_next):
+    t0 = time.monotonic()
+    response = await call_next(request)
+    ms = int((time.monotonic() - t0) * 1000)
+    _req_logger.info(
+        "%s %s → %d  %dms  pid=%d",
+        request.method, request.url.path, response.status_code, ms, os.getpid(),
+    )
+    return response
 
 
 @app.on_event("startup")
@@ -121,6 +146,7 @@ app.include_router(brand_source_mapping_router)
 app.include_router(department_source_mapping_router)
 app.include_router(planning_router)
 app.include_router(user_preferences_router)
+app.include_router(system_info_router)
 
 
 FRONT_BUILD_DIR = r"T:\planning_front\build"

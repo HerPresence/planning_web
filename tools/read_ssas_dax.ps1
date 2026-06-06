@@ -7,7 +7,8 @@
 param(
     [Parameter(Mandatory=$true)]  [string]$Server,
     [Parameter(Mandatory=$true)]  [string]$Database,
-    [Parameter(Mandatory=$true)]  [string]$Query,
+    [Parameter(Mandatory=$false)] [string]$Query     = "",
+    [Parameter(Mandatory=$false)] [string]$QueryFile = "",
     [Parameter(Mandatory=$false)] [string]$Login    = "",
     [Parameter(Mandatory=$false)] [string]$Password = "",
     [Parameter(Mandatory=$false)] [int]   $MaxRows  = 0
@@ -15,6 +16,23 @@ param(
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding            = [System.Text.Encoding]::UTF8
+
+# If -QueryFile is provided, read the DAX query from the file.
+# This avoids WinError 233 caused by PowerShell failing to parse a very long
+# or multi-line -Query command-line argument.
+if ($QueryFile -and (Test-Path $QueryFile -PathType Leaf)) {
+    Write-Output "[DEBUG] Reading query from QueryFile: $QueryFile"
+    $Query = [System.IO.File]::ReadAllText($QueryFile, [System.Text.Encoding]::UTF8)
+    Write-Output "[DEBUG] QueryFile read: $($Query.Length) chars"
+} elseif ($QueryFile) {
+    Write-Output "[DEBUG] QueryFile specified but not found: $QueryFile"
+}
+
+if (-not $Query) {
+    Write-Output "[FATAL] No query: neither -Query nor a valid -QueryFile was provided."
+    Out-Json @{ error = "No DAX query provided. Pass -Query or -QueryFile." }
+    exit 1
+}
 
 Write-Output "[DEBUG] NEW SCRIPT VERSION LOADED"
 Write-Output "[DEBUG] Script: $($MyInvocation.MyCommand.Path)"

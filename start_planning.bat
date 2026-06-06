@@ -3,826 +3,687 @@ chcp 65001 >nul 2>&1
 setlocal enabledelayedexpansion
 
 :: ================================================================
-::  METRICORE DEV LAUNCHER  v4
-::  Edit the CONFIG block below -- nothing else needs changing.
+::  METRICORE LAUNCHER v7
+::  Все через меню. Нічого вручну.
 :: ================================================================
 
-:: ================================================================
-::  CONFIG  -- adjust these paths to match your machine
-:: ================================================================
-set "PROJECT_ROOT=%~dp0"
-set "FRONT_ROOT=%~dp0..\planning_front"
-set "NGINX_DIR=C:\nginx"
+:: ── Базові шляхи (самовизначення) ───────────────────────────────
+set "WEB_DIR=%~dp0"
+if "!WEB_DIR:~-1!"=="\" set "WEB_DIR=!WEB_DIR:~0,-1!"
+set "FRONT_DIR=!WEB_DIR!\..\planning_front"
+
+:: ── Налаштування (перезаписуються launcher_config.bat) ──────────
+set "NGINX_DIR=C:\nginx-1.28.3\nginx-1.28.3"
 set "PG_BIN=C:\Program Files\PostgreSQL\18\bin"
-set "BACKEND_PORT=8002"
+set "BACKEND_PORT=8000"
 set "FRONTEND_PORT=3000"
 set "DB_PORT=5432"
 set "DB_NAME=planning_db"
 set "DB_USER=postgres"
 
-:: Derived -- do not edit below this line
-set "WEB_DIR=%PROJECT_ROOT%"
-set "FRONTEND_DIR=%FRONT_ROOT%"
-set "NGINX_EXE=%NGINX_DIR%\nginx.exe"
-set "PG_ISREADY=%PG_BIN%\pg_isready.exe"
-set "PSQL_EXE=%PG_BIN%\psql.exe"
-set "WIN_BACKEND=Metricore Backend"
-set "WIN_FRONTEND=Metricore Frontend"
+:: ── Завантажити збережений конфіг ───────────────────────────────
+set "LAUNCHER_CONFIG=!WEB_DIR!\launcher_config.bat"
+if exist "!LAUNCHER_CONFIG!" call "!LAUNCHER_CONFIG!"
 
-:: PID + Log dirs
-set "LAUNCHER_DIR=%PROJECT_ROOT%.launcher"
-set "LOG_DIR=%PROJECT_ROOT%logs\launcher"
-set "PID_BACKEND=%LAUNCHER_DIR%\backend.pid"
-set "PID_FRONTEND=%LAUNCHER_DIR%\frontend.pid"
-set "PID_POSTGRES=%LAUNCHER_DIR%\postgres.pid"
-set "LOG_FILE=%LOG_DIR%\launcher.log"
+:: ── Похідні шляхи ───────────────────────────────────────────────
+set "NGINX_EXE=!NGINX_DIR!\nginx.exe"
+set "NGINX_CONF_SRC=!WEB_DIR!\nginx.conf"
+set "NGINX_CONF_DST=!NGINX_DIR!\conf\nginx.conf"
+set "PG_ISREADY=!PG_BIN!\pg_isready.exe"
+set "PSQL_EXE=!PG_BIN!\psql.exe"
 
-:: Create dirs silently
-if not exist "%LAUNCHER_DIR%" mkdir "%LAUNCHER_DIR%" >nul 2>&1
-if not exist "%LOG_DIR%"      mkdir "%LOG_DIR%"      >nul 2>&1
+:: ── Папки для PID і логів ────────────────────────────────────────
+set "PID_DIR=!WEB_DIR!\.launcher"
+set "LOG_DIR=!WEB_DIR!\logs\launcher"
+set "PID_BE=!PID_DIR!\backend.pid"
+set "PID_FE=!PID_DIR!\frontend.pid"
+set "LOG_FILE=!LOG_DIR!\launcher.log"
+if not exist "!PID_DIR!" mkdir "!PID_DIR!" >nul 2>&1
+if not exist "!LOG_DIR!" mkdir "!LOG_DIR!" >nul 2>&1
 
-title Metricore DEV Launcher v4
+title Metricore Launcher v7
 
 :: ================================================================
-::  MAIN MENU
+::  ГОЛОВНЕ МЕНЮ
 :: ================================================================
 :MENU
 cls
-echo.
-echo  ================================================
-echo    METRICORE DEV LAUNCHER  v4
-echo  ================================================
-echo.
-echo   --- Daily Development ---
-echo   [1] Dev Start        postgres + backend + frontend
-echo   [2] Restart Backend  after Python/API changes
-echo   [3] Restart Frontend after React/JS changes
-echo   [5] Full Restart     kill all + start all
-echo.
-echo   --- Production ---
-echo   [4] Build + Deploy   build + nginx reload  (metricore.com.ua)
-echo   [9] Safe Deploy      same + confirmation prompt
-echo.
-echo   --- Tools ---
-echo   [6] Check Status     services, ports, bundle hash
-echo   [7] Open URLs        localhost / docs / metricore.com.ua
-echo   [8] Database Tools   PostgreSQL diagnostics
-echo.
-echo   [0] Exit
-echo.
-echo   Note: [3] = localhost dev server
-echo         [4]/[9] = metricore.com.ua production
-echo  ================================================
-echo.
-set "CHOICE="
-set /p CHOICE=  Enter option [0-9]:
+echo(
+echo  ============================================
+echo   METRICORE LAUNCHER v7
+echo  ============================================
+echo   Проект  : !WEB_DIR!
+echo   Backend : port !BACKEND_PORT!
+echo   nginx   : !NGINX_DIR!
+echo  --------------------------------------------
+echo(
+echo   [1] Запустити все        PostgreSQL + Backend + nginx + Frontend
+echo   [2] Перезапустити backend   (після змін Python)
+echo   [3] Перезапустити frontend  (після змін React)
+echo   [4] Build + Deploy          (оновити metricore.com.ua)
+echo   [5] Зупинити все
+echo(
+echo   [6] Статус               перевірити всі сервіси
+echo   [7] Переналаштувати      змінити шлях / порт / nginx
+echo   [8] Відкрити посилання   localhost / docs / metricore.com.ua
+echo   [9] Діагностика          перевірити процеси / порти / папки / git
+echo(
+echo   [0] Вихід
+echo  ============================================
+echo(
+set "C="
+set /p C=  Вибір:
 
-if "%CHOICE%"=="1" goto ACTION_DEV_START
-if "%CHOICE%"=="2" goto ACTION_RESTART_BACKEND
-if "%CHOICE%"=="3" goto ACTION_RESTART_FRONTEND
-if "%CHOICE%"=="4" goto ACTION_BUILD_DEPLOY
-if "%CHOICE%"=="5" goto ACTION_FULL_RESTART
-if "%CHOICE%"=="6" goto ACTION_CHECK_STATUS
-if "%CHOICE%"=="7" goto ACTION_OPEN_URLS
-if "%CHOICE%"=="8" goto ACTION_DB_TOOLS
-if "%CHOICE%"=="9" goto ACTION_SAFE_DEPLOY
-if "%CHOICE%"=="0" goto ACTION_EXIT
-
-echo.
-echo  [!] Invalid choice. Enter 0-9.
+if "!C!"=="1" goto START_ALL
+if "!C!"=="2" goto RESTART_BACKEND
+if "!C!"=="3" goto RESTART_FRONTEND
+if "!C!"=="4" goto BUILD_DEPLOY
+if "!C!"=="5" goto STOP_ALL
+if "!C!"=="6" goto CHECK_STATUS
+if "!C!"=="7" goto WIZARD
+if "!C!"=="8" goto OPEN_URLS
+if "!C!"=="9" goto DIAGNOSTICS
+if "!C!"=="0" goto EXIT_LAUNCHER
+echo  Невірний вибір.
 timeout /t 2 /nobreak >nul
 goto MENU
 
 
 :: ================================================================
-::  [1] DEV START
+::  [1] ЗАПУСТИТИ ВСЕ
 :: ================================================================
-:ACTION_DEV_START
-call :FN_LOG "=== DEV START ==="
+:START_ALL
 cls
-echo.
-echo  ================================================
-echo   DEV START  --  postgres + backend + frontend
-echo  ================================================
-echo.
+echo(
+echo  ============================================
+echo   ЗАПУСК СИСТЕМИ
+echo  ============================================
+echo(
 
-echo  [1/3] Checking PostgreSQL...
-call :FN_ENSURE_POSTGRES
-if %errorlevel% neq 0 (
-    echo.
-    echo  [!!] PostgreSQL failed -- aborting.
-    echo       Run services.msc and check PlanningPostgreSQL service.
-    call :FN_LOG "ABORT: PostgreSQL failed"
-    pause
-    goto MENU
+:: 1. PostgreSQL
+echo  [1/4] PostgreSQL...
+call :ENSURE_POSTGRES
+if !errorlevel!==0 (
+    echo   OK  PostgreSQL на порту !DB_PORT!
+) else (
+    echo   ПОМИЛКА  PostgreSQL не запустився
+    echo   Перевірте services.msc - служба PlanningPostgreSQL
+    pause & goto MENU
 )
-echo   [OK] PostgreSQL ready  (port %DB_PORT%)
-echo.
 
-echo  [2/3] Starting Backend...
-call :FN_STOP_BACKEND
-call :FN_START_BACKEND
-if %errorlevel% neq 0 (
-    echo.
-    echo  [!!] Backend failed -- check %WIN_BACKEND% window.
-    call :FN_LOG "ABORT: Backend failed"
-    pause
-    goto MENU
+:: 2. Backend
+echo(
+echo  [2/4] Backend...
+call :CHECK_BACKEND_HTTP
+if !HEALTH_OK!==1 (
+    echo   OK  Backend вже запущено на порту !BACKEND_PORT!
+) else (
+    call :STOP_BACKEND
+    call :START_BACKEND_WINDOW
+    echo   Чекаю запуску backend ^(до 60 сек^)...
+    call :WAIT_BACKEND
+    if !HEALTH_OK!==1 (
+        echo   OK  Backend запущено на порту !BACKEND_PORT!
+    ) else (
+        echo   УВАГА  Backend не відповів за 60 сек
+        echo   Перевірте вікно "Metricore Backend" на помилки
+    )
 )
-call :FN_CAPTURE_BACKEND_PID
-echo   [OK] Backend ready  http://127.0.0.1:%BACKEND_PORT%  PID: !BACKEND_PID!
-call :FN_LOG "Backend ready PID=!BACKEND_PID!"
-echo.
 
-echo  [3/3] Starting Frontend...
-call :FN_STOP_FRONTEND
-call :FN_START_FRONTEND
-if %errorlevel% neq 0 (
-    echo.
-    echo  [!!] Frontend failed -- check %WIN_FRONTEND% window.
-    call :FN_LOG "ABORT: Frontend failed"
-    pause
-    goto MENU
+:: 3. nginx
+echo(
+echo  [3/4] nginx...
+if exist "!NGINX_EXE!" (
+    if exist "!NGINX_CONF_SRC!" (
+        copy /y "!NGINX_CONF_SRC!" "!NGINX_CONF_DST!" >nul 2>&1
+    )
+    tasklist 2>nul | findstr /i "nginx.exe" >nul 2>&1
+    if !errorlevel!==0 (
+        "!NGINX_EXE!" -s reload >nul 2>&1
+        echo   OK  nginx перезавантажено
+    ) else (
+        start "" "!NGINX_EXE!"
+        timeout /t 2 /nobreak >nul
+        echo   OK  nginx запущено
+    )
+) else (
+    echo   ПРОПУСК  nginx не знайдено: !NGINX_EXE!
+    echo   Запустіть [7] для налаштування шляху nginx
 )
-call :FN_CAPTURE_FRONTEND_PID
-echo   [OK] Frontend ready  http://localhost:%FRONTEND_PORT%  PID: !FRONTEND_PID!
-call :FN_LOG "Frontend ready PID=!FRONTEND_PID!"
 
-start "" "http://localhost:%FRONTEND_PORT%"
-call :FN_LOG "System started OK"
+:: 4. Frontend
+echo(
+echo  [4/4] Frontend dev server...
+call :CHECK_FRONTEND
+if !FE_RUNNING!==1 (
+    echo   OK  Frontend вже запущено на порту !FRONTEND_PORT!
+) else (
+    call :STOP_FRONTEND
+    call :START_FRONTEND_WINDOW
+    echo   Чекаю запуску frontend ^(до 120 сек^)...
+    call :WAIT_FRONTEND
+    if !FE_RUNNING!==1 (
+        echo   OK  Frontend запущено на порту !FRONTEND_PORT!
+    ) else (
+        echo   УВАГА  Frontend не запустився за 120 сек
+    )
+)
 
-echo.
-echo  ================================================
-echo   SYSTEM READY
-echo  ================================================
-echo   Postgres  : OK  port %DB_PORT%
-echo   Backend   : OK  port %BACKEND_PORT%  PID: !BACKEND_PID!
-echo   Frontend  : OK  port %FRONTEND_PORT%  PID: !FRONTEND_PID!
-echo   Browser   : http://localhost:%FRONTEND_PORT%
-echo  ================================================
-echo.
-echo  (Press any key to return to menu)
-pause >nul
+:: Відкрити браузер
+start "" "http://localhost:!FRONTEND_PORT!"
+
+echo(
+echo  ============================================
+echo   СИСТЕМА ЗАПУЩЕНА
+echo  ============================================
+echo   localhost:!FRONTEND_PORT!       - розробка
+echo   metricore.com.ua    - продакшн
+echo  ============================================
+call :LOG "START_ALL done"
+echo(
+pause
 goto MENU
 
 
 :: ================================================================
-::  [2] RESTART BACKEND
+::  [2] ПЕРЕЗАПУСТИТИ BACKEND
 :: ================================================================
-:ACTION_RESTART_BACKEND
-call :FN_LOG "=== RESTART BACKEND ==="
+:RESTART_BACKEND
 cls
-echo.
-echo  ================================================
-echo   RESTART BACKEND  --  after Python/API changes
-echo  ================================================
-echo.
-
-echo  Stopping backend...
-call :FN_STOP_BACKEND
+echo(
+echo  Зупиняю backend...
+call :STOP_BACKEND
 timeout /t 2 /nobreak >nul
-
-echo  Starting backend...
-call :FN_START_BACKEND
-if %errorlevel% neq 0 (
-    echo.
-    echo  [!!] Backend restart failed.
-    call :FN_LOG "ERROR: Backend restart failed"
-    pause
-    goto MENU
+echo  Запускаю backend...
+call :START_BACKEND_WINDOW
+echo  Чекаю ^(до 60 сек^)...
+call :WAIT_BACKEND
+if !HEALTH_OK!==1 (
+    echo   OK  Backend на порту !BACKEND_PORT!
+) else (
+    echo   Не вдалось. Перевірте вікно "Metricore Backend".
 )
-call :FN_CAPTURE_BACKEND_PID
-
-echo.
-echo   [OK] Backend restarted successfully
-echo   URL : http://127.0.0.1:%BACKEND_PORT%
-echo   PID : !BACKEND_PID!
-call :FN_LOG "Backend restarted PID=!BACKEND_PID!"
-echo.
+call :LOG "RESTART_BACKEND"
 timeout /t 3 /nobreak >nul
 goto MENU
 
 
 :: ================================================================
-::  [3] RESTART FRONTEND  (localhost dev server)
+::  [3] ПЕРЕЗАПУСТИТИ FRONTEND
 :: ================================================================
-:ACTION_RESTART_FRONTEND
-call :FN_LOG "=== RESTART FRONTEND DEV ==="
+:RESTART_FRONTEND
 cls
-echo.
-echo  ================================================
-echo   RESTART FRONTEND  --  localhost:%FRONTEND_PORT% dev server
-echo  ================================================
-echo.
-echo   Note: This restarts the LOCAL dev server (npm start).
-echo         For production deploy use [4] Build + Deploy.
-echo.
-
-echo  Stopping frontend dev server...
-call :FN_STOP_FRONTEND
+echo(
+echo  Зупиняю frontend...
+call :STOP_FRONTEND
 timeout /t 2 /nobreak >nul
-
-echo  Starting frontend dev server...
-call :FN_START_FRONTEND
-if %errorlevel% neq 0 (
-    echo.
-    echo  [!!] Frontend restart failed.
-    call :FN_LOG "ERROR: Frontend restart failed"
-    pause
-    goto MENU
+echo  Запускаю frontend...
+call :START_FRONTEND_WINDOW
+echo  Чекаю ^(до 120 сек^)...
+call :WAIT_FRONTEND
+if !FE_RUNNING!==1 (
+    echo   OK  Frontend на порту !FRONTEND_PORT!
+) else (
+    echo   Не вдалось. Перевірте вікно "Metricore Frontend".
 )
-call :FN_CAPTURE_FRONTEND_PID
-
-echo.
-echo   [OK] Frontend restarted successfully
-echo   URL : http://localhost:%FRONTEND_PORT%
-echo   PID : !FRONTEND_PID!
-call :FN_LOG "Frontend restarted PID=!FRONTEND_PID!"
-echo.
+call :LOG "RESTART_FRONTEND"
 timeout /t 3 /nobreak >nul
 goto MENU
 
 
 :: ================================================================
-::  [4] BUILD + DEPLOY  (no confirmation)
+::  [4] BUILD + DEPLOY (оновити metricore.com.ua)
 :: ================================================================
-:ACTION_BUILD_DEPLOY
-call :FN_LOG "=== BUILD + DEPLOY ==="
+:BUILD_DEPLOY
 cls
-echo.
-echo  ================================================
-echo   BUILD + DEPLOY  --  production metricore.com.ua
-echo  ================================================
-echo.
-goto _DO_BUILD_DEPLOY
-
-
-:: ================================================================
-::  [9] SAFE DEPLOY  (with confirmation)
-:: ================================================================
-:ACTION_SAFE_DEPLOY
-call :FN_LOG "=== SAFE DEPLOY (confirm) ==="
-cls
-echo.
-echo  ================================================
-echo   PRODUCTION SAFE DEPLOY
-echo  ================================================
-echo.
-echo   You are about to update metricore.com.ua.
-echo.
-echo   This will:
-echo     - run npm build  (~2-5 minutes)
-echo     - reload nginx
-echo     - serve new bundle to all users
-echo.
-echo  ------------------------------------------------
-set "CONFIRM="
-set /p CONFIRM=  Are you sure? Type YES to continue:
-
-if /i not "%CONFIRM%"=="YES" (
-    echo.
-    echo   Deploy cancelled.
-    call :FN_LOG "Safe deploy cancelled"
+echo(
+echo  ============================================
+echo   BUILD + DEPLOY
+echo  ============================================
+echo(
+echo  Зупиняю nginx перед збіркою...
+if exist "!NGINX_EXE!" (
+    "!NGINX_EXE!" -s stop >nul 2>&1
+    taskkill /IM nginx.exe /F >nul 2>&1
     timeout /t 2 /nobreak >nul
-    goto MENU
+    echo   OK  nginx зупинено
 )
-echo.
-call :FN_LOG "Safe deploy confirmed"
-
-:: ================================================================
-::  SHARED BUILD LOGIC  (used by [4] and [9])
-:: ================================================================
-:_DO_BUILD_DEPLOY
-
-:: Pre-check: run_build.py exists
-set "BUILD_SCRIPT=%FRONT_ROOT%\run_build.py"
-if not exist "%BUILD_SCRIPT%" (
-    echo.
-    echo  [!!] ERROR: run_build.py not found!
-    echo.
-    echo   Expected : %BUILD_SCRIPT%
-    echo   Current  : %CD%
-    echo   FRONT_ROOT = %FRONT_ROOT%
-    echo.
-    echo   Do NOT run start_planning.bat from C:\Windows\System32
-    echo   Launch it from: %PROJECT_ROOT%
-    call :FN_LOG "ERROR: run_build.py not found: %BUILD_SCRIPT%"
-    pause
-    goto MENU
-)
-
-:: Record old bundle hash
-set "OLD_BUNDLE=none"
-for /f "tokens=*" %%f in ('dir /b "%FRONT_ROOT%\build\static\js\main.*.js" 2^>nul') do set "OLD_BUNDLE=%%f"
-echo   Previous bundle : %OLD_BUNDLE%
-echo.
-
-:: Step 1: Build
-echo  [1/3] Running npm build...
-echo        Source : %FRONT_ROOT%\src
-echo        Output : %FRONT_ROOT%\build
-echo        This takes 2-5 minutes...
-echo  ------------------------------------------------
-
-pushd "%FRONT_ROOT%"
+echo(
+echo  Збираю frontend ^(2-5 хвилин^)...
+set "_OLD_BUNDLE=none"
+for /f "tokens=*" %%f in ('dir /b "!FRONT_DIR!\build\static\js\main.*.js" 2^>nul') do set "_OLD_BUNDLE=%%f"
+echo   Поточний bundle: !_OLD_BUNDLE!
+echo(
+pushd "!FRONT_DIR!"
 python run_build.py
-set "_BUILD_FAILED=0"
-if errorlevel 1 set "_BUILD_FAILED=1"
+set "_BUILD_ERR=!errorlevel!"
 popd
-
-echo  ------------------------------------------------
-echo.
-
-if "%_BUILD_FAILED%"=="1" (
-    echo  ================================================
-    echo   BUILD FAILED
-    echo  ================================================
-    echo   Fix errors shown above, then retry.
-    call :FN_LOG "BUILD FAILED"
-    pause
-    goto MENU
-)
-
-:: Step 2: Capture new bundle hash
-set "NEW_BUNDLE=none"
-for /f "tokens=*" %%f in ('dir /b "%FRONT_ROOT%\build\static\js\main.*.js" 2^>nul') do set "NEW_BUNDLE=%%f"
-
-:: Step 3: Reload nginx
-echo  [2/3] Reloading nginx...
-call :FN_RELOAD_NGINX
-if !NGINX_OK!==1 (
-    echo   [OK] nginx reloaded -- new bundle is live.
+echo(
+if "!_BUILD_ERR!"=="0" (
+    set "_NEW_BUNDLE=none"
+    for /f "tokens=*" %%f in ('dir /b "!FRONT_DIR!\build\static\js\main.*.js" 2^>nul') do set "_NEW_BUNDLE=%%f"
+    echo   OK  Новий bundle: !_NEW_BUNDLE!
 ) else (
-    echo   [!] nginx reload skipped or failed.
-    echo       Checked: %NGINX_EXE%
-    echo       Run manually: nginx -s reload
+    echo   ПОМИЛКА збірки. Запускаю nginx назад...
+    if exist "!NGINX_EXE!" start "" "!NGINX_EXE!"
+    call :LOG "BUILD FAILED"
+    pause & goto MENU
 )
-
-:: Step 4: Verify build output
-echo.
-echo  [3/3] Verifying build...
-set "BUILD_INDEX=%FRONT_ROOT%\build\index.html"
-if exist "%BUILD_INDEX%" (
-    echo   [OK] build\index.html exists.
-) else (
-    echo   [!!] build\index.html NOT found!
+echo(
+echo  Копіюю nginx.conf та запускаю nginx...
+if exist "!NGINX_CONF_SRC!" (
+    if not exist "!NGINX_DIR!\conf" mkdir "!NGINX_DIR!\conf" >nul 2>&1
+    copy /y "!NGINX_CONF_SRC!" "!NGINX_CONF_DST!" >nul 2>&1
 )
-
-:: Summary
-echo.
-echo  ================================================
-echo   BUILD + DEPLOY RESULT
-echo  ================================================
-if "%OLD_BUNDLE%"=="%NEW_BUNDLE%" (
-    if "%NEW_BUNDLE%"=="none" (
-        echo   [!!] No bundle in build\static\js\
-    ) else (
-        echo   Bundle  : UNCHANGED -- %NEW_BUNDLE%
-        echo   Source not modified since last build.
-    )
-) else (
-    echo   Old     : %OLD_BUNDLE%
-    echo   New     : %NEW_BUNDLE%
-    echo   [OK] Bundle hash updated!
+if exist "!NGINX_EXE!" (
+    start "" "!NGINX_EXE!"
+    timeout /t 2 /nobreak >nul
+    echo   OK  nginx запущено
 )
-echo.
-echo   Path : %FRONT_ROOT%\build
-if !NGINX_OK!==1 (
-    echo.
-    echo   [OK] metricore.com.ua is now updated.
-    echo        Browser: Ctrl+Shift+R for hard refresh.
-) else (
-    echo.
-    echo   [!] nginx was NOT reloaded -- run manually to go live.
-)
-echo  ================================================
-call :FN_LOG "BUILD+DEPLOY OK old=%OLD_BUNDLE% new=%NEW_BUNDLE%"
-echo.
+echo(
+echo  ============================================
+echo   DEPLOY ЗАВЕРШЕНО
+echo   Ctrl+Shift+R в браузері для hard refresh
+echo  ============================================
+call :LOG "BUILD_DEPLOY done old=!_OLD_BUNDLE! new=!_NEW_BUNDLE!"
 pause
 goto MENU
 
 
 :: ================================================================
-::  [5] FULL RESTART
+::  [5] ЗУПИНИТИ ВСЕ
 :: ================================================================
-:ACTION_FULL_RESTART
-call :FN_LOG "=== FULL RESTART ==="
+:STOP_ALL
 cls
-echo.
-echo  ================================================
-echo   FULL RESTART  --  kill all + start all
-echo  ================================================
-echo.
-echo  Stopping all services...
-call :FN_STOP_FRONTEND
-call :FN_STOP_BACKEND
-echo  Waiting for clean shutdown (3s)...
+echo  Зупиняю frontend...
+call :STOP_FRONTEND
+echo  Зупиняю backend...
+call :STOP_BACKEND
+echo  Зупиняю nginx...
+if exist "!NGINX_EXE!" "!NGINX_EXE!" -s stop >nul 2>&1
+taskkill /IM nginx.exe /F >nul 2>&1
+echo   OK  Все зупинено.
+call :LOG "STOP_ALL"
 timeout /t 3 /nobreak >nul
-echo  Starting all services...
-echo.
-goto ACTION_DEV_START
+goto MENU
 
 
 :: ================================================================
-::  [6] CHECK STATUS
+::  [6] СТАТУС
 :: ================================================================
-:ACTION_CHECK_STATUS
+:CHECK_STATUS
 cls
-echo.
-echo  ================================================
-echo   CHECK STATUS  --  services, ports, build info
-echo  ================================================
-echo.
+echo(
+echo  ============================================
+echo   СТАТУС СИСТЕМИ
+echo  ============================================
+echo   Проект  : !WEB_DIR!
+echo   Backend : port !BACKEND_PORT!
+echo(
 
-:: PostgreSQL
-set "_PG_ST=DOWN   " & set "_PG_PID=---"
-"%PG_ISREADY%" -h 127.0.0.1 -p %DB_PORT% -q >nul 2>&1
+set "_PG=DOWN"
+"!PG_ISREADY!" -h 127.0.0.1 -p !DB_PORT! -q >nul 2>&1
+if !errorlevel!==0 set "_PG=RUNNING"
+echo   PostgreSQL : !_PG!   ^(port !DB_PORT!^)
+
+set "_BE=DOWN"
+netstat -ano 2>nul | findstr ":!BACKEND_PORT! " | findstr "LISTENING" >nul 2>&1
 if !errorlevel!==0 (
-    set "_PG_ST=RUNNING"
-    for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%DB_PORT% " ^| findstr "LISTENING"') do set "_PG_PID=%%a"
+    set "_BE=RUNNING"
+    call :CHECK_BACKEND_HTTP
+    if !HEALTH_OK!==1 (set "_BE=RUNNING ^(HTTP OK^)") else (set "_BE=RUNNING ^(HTTP не відповів^)")
 )
-echo   PostgreSQL : !_PG_ST!   port %DB_PORT%    PID: !_PG_PID!
+echo   Backend    : !_BE!   ^(port !BACKEND_PORT!^)
 
-:: Backend
-set "_BE_ST=DOWN   " & set "_BE_PID=---" & set "_BE_HTTP=---"
-netstat -ano 2>nul | findstr ":%BACKEND_PORT% " | findstr "LISTENING" >nul 2>&1
-if !errorlevel!==0 (
-    set "_BE_ST=RUNNING"
-    for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%BACKEND_PORT% " ^| findstr "LISTENING"') do set "_BE_PID=%%a"
-    call :FN_HEALTH_BACKEND
-    if !HEALTH_OK!==1 (set "_BE_HTTP=HTTP OK") else (set "_BE_HTTP=HTTP FAIL")
+set "_FE=DOWN"
+netstat -ano 2>nul | findstr ":!FRONTEND_PORT! " | findstr "LISTENING" >nul 2>&1
+if !errorlevel!==0 set "_FE=RUNNING"
+echo   Frontend   : !_FE!   ^(port !FRONTEND_PORT!^)
+
+set "_NGX=DOWN"
+tasklist 2>nul | findstr /i "nginx.exe" >nul 2>&1
+if !errorlevel!==0 set "_NGX=RUNNING"
+echo   nginx      : !_NGX!   ^(port 80^)
+
+echo(
+echo   --- Build ---
+set "_BND=^(немає^)"
+for /f "tokens=*" %%f in ('dir /b "!FRONT_DIR!\build\static\js\main.*.js" 2^>nul') do set "_BND=%%f"
+echo   Bundle: !_BND!
+if exist "!FRONT_DIR!\build\index.html" (
+    for /f "tokens=*" %%t in ('powershell -NoProfile -NonInteractive -Command "(Get-Item '!FRONT_DIR!\build\index.html').LastWriteTime.ToString('yyyy-MM-dd HH:mm')" 2^>nul') do echo   Built : %%t
 )
-echo   Backend    : !_BE_ST!   port %BACKEND_PORT%    PID: !_BE_PID!   !_BE_HTTP!
-
-:: Frontend dev
-set "_FE_ST=DOWN   " & set "_FE_PID=---"
-netstat -ano 2>nul | findstr ":%FRONTEND_PORT% " | findstr "LISTENING" >nul 2>&1
-if !errorlevel!==0 (
-    set "_FE_ST=RUNNING"
-    for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%FRONTEND_PORT% " ^| findstr "LISTENING"') do set "_FE_PID=%%a"
-)
-echo   Frontend   : !_FE_ST!   port %FRONTEND_PORT%    PID: !_FE_PID!   (dev server)
-
-:: nginx
-set "_NGX_ST=DOWN   "
-netstat -ano 2>nul | findstr ":80 " | findstr "LISTENING" >nul 2>&1
-if !errorlevel!==0 set "_NGX_ST=RUNNING"
-echo   nginx      : !_NGX_ST!   port 80  (metricore.com.ua)
-
-:: Build info
-echo.
-echo   --- Production Build ---
-set "_BUNDLE=(none)"
-for /f "tokens=*" %%f in ('dir /b "%FRONT_ROOT%\build\static\js\main.*.js" 2^>nul') do set "_BUNDLE=%%f"
-echo   Bundle  : !_BUNDLE!
-if exist "%FRONT_ROOT%\build\index.html" (
-    for /f "tokens=*" %%t in ('powershell -NoProfile -NonInteractive -Command "(Get-Item '%FRONT_ROOT%\build\index.html').LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')" 2^>nul') do (
-        echo   Built   : %%t
-    )
-) else (
-    echo   Built   : (no build found)
-)
-echo   Path    : %FRONT_ROOT%\build
-
-:: Saved PIDs
-echo.
-echo   --- Saved PIDs ---
-if exist "%PID_BACKEND%"  (set /p _SP=<"%PID_BACKEND%"  & echo   backend.pid  = !_SP!)  else echo   backend.pid  = (none)
-if exist "%PID_FRONTEND%" (set /p _SP=<"%PID_FRONTEND%" & echo   frontend.pid = !_SP!)  else echo   frontend.pid = (none)
-
-:: Recent log
-echo.
-echo   --- Last 5 log entries ---
-if exist "%LOG_FILE%" (
-    powershell -NoProfile -NonInteractive -Command "Get-Content '%LOG_FILE%' -Tail 5" 2>nul
-) else (
-    echo   (no log yet)
-)
-
-echo.
-echo  ================================================
+echo(
+echo  ============================================
 pause
 goto MENU
 
 
 :: ================================================================
-::  [7] OPEN URLS
+::  [7] МАЙСТЕР ПЕРЕНАЛАШТУВАННЯ
 :: ================================================================
-:ACTION_OPEN_URLS
+:WIZARD
 cls
-echo.
-echo  ================================================
-echo   OPEN URLS
-echo  ================================================
-echo.
-echo   [1] http://localhost:%FRONTEND_PORT%         (dev frontend)
-echo   [2] http://localhost:%BACKEND_PORT%/docs     (API docs)
-echo   [3] http://metricore.com.ua        (production)
-echo   [A] All three
-echo.
-set "UCHOICE="
-set /p UCHOICE=  Which [1/2/3/A]:
+echo(
+echo  ============================================
+echo   ПЕРЕНАЛАШТУВАННЯ ШЛЯХІВ
+echo  ============================================
+echo(
+echo   Поточний шлях проекту: !WEB_DIR!\..
+echo   ^(Або залиш порожнім для автоматичного визначення^)
+echo(
 
-if /i "%UCHOICE%"=="1" (
-    start "" "http://localhost:%FRONTEND_PORT%"
-    echo   Opened: localhost:%FRONTEND_PORT%
+set "_NP="
+set /p _NP=  Новий шлях до папки Metricore (Enter = !WEB_DIR!\..):
+if "!_NP!"=="" (
+    set "_NP=!WEB_DIR!\.."
+    echo   Використовую: !_NP!
 )
-if /i "%UCHOICE%"=="2" (
-    start "" "http://localhost:%BACKEND_PORT%/docs"
-    echo   Opened: localhost:%BACKEND_PORT%/docs
+if "!_NP:~-1!"=="\" set "_NP=!_NP:~0,-1!"
+
+set "_NF=!_NP!\planning_front"
+set "_NB=!_NP!\planning_web"
+
+echo(
+if exist "!_NF!\package.json" (echo   OK  planning_front знайдено) else (echo   НЕ ЗНАЙДЕНО: !_NF!)
+if exist "!_NB!\main.py"      (echo   OK  planning_web знайдено)  else (echo   НЕ ЗНАЙДЕНО: !_NB!)
+
+echo(
+set "_NPORT="
+set /p _NPORT=  Backend порт [!BACKEND_PORT!]:
+if "!_NPORT!"=="" set "_NPORT=!BACKEND_PORT!"
+
+echo(
+set "_NNE=!NGINX_EXE!"
+echo   Поточний nginx: !_NNE!
+set "_NNEW="
+set /p _NNEW=  Шлях до nginx.exe (Enter = залишити):
+if not "!_NNEW!"=="" set "_NNE=!_NNEW!"
+
+set "_NND=!_NNE!"
+for %%d in ("!_NNE!") do set "_NND=%%~dpd"
+if "!_NND:~-1!"=="\" set "_NND=!_NND:~0,-1!"
+
+:: Зберегти конфіг
+echo(
+echo   Зберігаю конфіг...
+> "!_NB!\launcher_config.bat" echo set "NGINX_DIR=!_NND!"
+>> "!_NB!\launcher_config.bat" echo set "BACKEND_PORT=!_NPORT!"
+
+:: Оновити nginx.conf
+set "_BFWD=!_NF!\build"
+set "_BFWD=!_BFWD:\=/!"
+call :WRITE_NGINX_CONF "!_NB!\nginx.conf" "!_BFWD!" "!_NPORT!"
+echo   OK  nginx.conf оновлено
+
+:: Скопіювати nginx.conf
+if exist "!_NNE!" (
+    if not exist "!_NND!\conf" mkdir "!_NND!\conf" >nul 2>&1
+    copy /y "!_NB!\nginx.conf" "!_NND!\conf\nginx.conf" >nul 2>&1
+    "!_NNE!" -t >nul 2>&1
+    if !errorlevel!==0 (
+        echo   OK  nginx.conf скопійовано і перевірено
+        "!_NNE!" -s reload >nul 2>&1
+        if !errorlevel!==0 (
+            echo   OK  nginx перезавантажено
+        ) else (
+            taskkill /IM nginx.exe /F >nul 2>&1
+            timeout /t 1 /nobreak >nul
+            start "" "!_NNE!"
+            echo   OK  nginx перезапущено
+        )
+    ) else (
+        echo   ПОМИЛКА nginx -t. Перевірте конфіг.
+    )
 )
-if /i "%UCHOICE%"=="3" (
-    start "" "http://metricore.com.ua"
-    echo   Opened: metricore.com.ua
-)
-if /i "%UCHOICE%"=="a" (
-    start "" "http://localhost:%FRONTEND_PORT%"
-    start "" "http://localhost:%BACKEND_PORT%/docs"
-    start "" "http://metricore.com.ua"
-    echo   Opened all three URLs.
-)
-call :FN_LOG "Open URLs: %UCHOICE%"
-echo.
+
+:: Застосувати до поточного сеансу
+set "NGINX_DIR=!_NND!"
+set "NGINX_EXE=!_NNE!"
+set "BACKEND_PORT=!_NPORT!"
+set "NGINX_CONF_SRC=!_NB!\nginx.conf"
+set "NGINX_CONF_DST=!_NND!\conf\nginx.conf"
+set "LAUNCHER_CONFIG=!_NB!\launcher_config.bat"
+
+echo(
+echo  ============================================
+echo   Готово! Тепер запустіть [1] Запустити все.
+echo  ============================================
+call :LOG "WIZARD done port=!_NPORT! nginx=!_NNE!"
+pause
+goto MENU
+
+
+:: ================================================================
+::  [8] ВІДКРИТИ ПОСИЛАННЯ
+:: ================================================================
+:OPEN_URLS
+start "" "http://localhost:!FRONTEND_PORT!"
+start "" "http://localhost:!BACKEND_PORT!/docs"
+start "" "http://metricore.com.ua"
+echo  Відкрито три вкладки.
 timeout /t 2 /nobreak >nul
 goto MENU
 
 
 :: ================================================================
-::  [8] DATABASE TOOLS
+::  [9] ДІАГНОСТИКА
 :: ================================================================
-:ACTION_DB_TOOLS
+:DIAGNOSTICS
 cls
-echo.
-echo  ================================================
-echo   DATABASE TOOLS  --  PostgreSQL diagnostics
-echo  ================================================
-echo.
-
-:: Check 1: pg_isready
-echo  [1/5] pg_isready...
-if exist "%PG_ISREADY%" (
-    "%PG_ISREADY%" -h 127.0.0.1 -p %DB_PORT% -q >nul 2>&1
-    if !errorlevel!==0 (
-        echo   [OK] PostgreSQL accepting connections  (port %DB_PORT%)
-    ) else (
-        echo   [!!] PostgreSQL NOT ready on port %DB_PORT%
-    )
+echo(
+echo  ============================================
+echo   METRICORE DIAGNOSTICS
+echo  ============================================
+echo   Час: %date% %time%
+echo(
+echo  --- Шляхи ---
+echo   PROJECT_ROOT  : !WEB_DIR!
+echo   FRONT_DIR     : !FRONT_DIR!
+echo   NGINX_DIR     : !NGINX_DIR!
+echo   BACKEND_PORT  : !BACKEND_PORT!
+echo   FRONTEND_PORT : !FRONTEND_PORT!
+echo(
+echo  --- nginx proxy_pass (з nginx.conf) ---
+if exist "!NGINX_CONF_SRC!" (
+    findstr /i "proxy_pass" "!NGINX_CONF_SRC!" 2>nul
 ) else (
-    echo   [!] pg_isready not found: %PG_ISREADY%
+    echo   nginx.conf не знайдено: !NGINX_CONF_SRC!
 )
-
-:: Check 2: Windows service
-echo.
-echo  [2/5] Windows service...
-set "_SVC=unknown"
-for /f "tokens=3" %%s in ('sc query PlanningPostgreSQL 2^>nul ^| findstr "STATE"') do set "_SVC=%%s"
-if "!_SVC!"=="4"       echo   [OK] PlanningPostgreSQL: RUNNING
-if "!_SVC!"=="1"       echo   [!!] PlanningPostgreSQL: STOPPED
-if "!_SVC!"=="unknown" echo   [?]  PlanningPostgreSQL: service not found
-
-:: Check 3: .env file
-echo.
-echo  [3/5] .env file...
-set "ENV_FILE=%PROJECT_ROOT%.env"
-if exist "%ENV_FILE%" (
-    echo   [OK] .env found: %ENV_FILE%
+echo(
+echo  --- Frontend proxy (з package.json) ---
+if exist "!FRONT_DIR!\package.json" (
+    findstr /i "proxy" "!FRONT_DIR!\package.json" 2>nul
 ) else (
-    echo   [!] .env not found: %ENV_FILE%
-    echo       Using defaults from config.py
+    echo   package.json не знайдено
 )
-
-:: Check 4: DB exists
-echo.
-echo  [4/5] Database '%DB_NAME%'...
-if exist "%PSQL_EXE%" (
-    "%PSQL_EXE%" -U %DB_USER% -h 127.0.0.1 -p %DB_PORT% -lqt 2>nul | findstr /i "%DB_NAME%" >nul 2>&1
-    if !errorlevel!==0 (
-        echo   [OK] Database '%DB_NAME%' exists
-    ) else (
-        echo   [!!] Database '%DB_NAME%' NOT found
-        echo        Run: CREATE DATABASE %DB_NAME%;
-    )
-) else (
-    echo   [!] psql not found: %PSQL_EXE%
+echo(
+echo  --- Порти (netstat) ---
+echo   Backend  :%BACKEND_PORT%:
+netstat -ano 2>nul | findstr ":!BACKEND_PORT! " | findstr "LISTENING"
+echo   Frontend :%FRONTEND_PORT%:
+netstat -ano 2>nul | findstr ":!FRONTEND_PORT! " | findstr "LISTENING"
+echo   nginx :80:
+netstat -ano 2>nul | findstr ":80 " | findstr "LISTENING"
+echo(
+echo  --- Python процеси ---
+wmic process where "name='python.exe' or name='python3.exe'" get processid,commandline 2>nul | findstr /v "^$"
+echo(
+echo  --- Node процеси ---
+wmic process where "name='node.exe'" get processid,commandline 2>nul | findstr /v "^$"
+echo(
+echo  --- git status planning_web ---
+pushd "!WEB_DIR!" >nul 2>&1
+git -C "!WEB_DIR!" log --oneline -3 2>nul
+git -C "!WEB_DIR!" status --short 2>nul
+popd >nul 2>&1
+echo(
+echo  --- GET /api/system/runtime-info ---
+curl -sf --max-time 5 "http://127.0.0.1:!BACKEND_PORT!/api/system/runtime-info" 2>nul
+if errorlevel 1 (
+    echo   ПОМИЛКА: backend не відповідає на http://127.0.0.1:!BACKEND_PORT!
+    echo   Спробуйте також: curl http://localhost:!BACKEND_PORT!/api/system/runtime-info
 )
-
-:: Check 5: Table count
-echo.
-echo  [5/5] Table count in %DB_NAME%...
-if exist "%PSQL_EXE%" (
-    for /f %%c in ('"%PSQL_EXE%" -U %DB_USER% -h 127.0.0.1 -p %DB_PORT% -d %DB_NAME% -tAc "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='"'"'public'"'"'" 2^>nul') do (
-        echo   [OK] Tables in public schema: %%c
-    )
-) else (
-    echo   (psql not found -- skipped)
-)
-
-echo.
-echo  ================================================
-call :FN_LOG "DB Tools check done"
+echo(
+echo  ============================================
 pause
 goto MENU
 
 
 :: ================================================================
-::  [0] EXIT
+::  [0] ВИХІД
 :: ================================================================
-:ACTION_EXIT
-echo.
-echo  Metricore DEV Launcher closed.
-echo.
+:EXIT_LAUNCHER
+echo  До побачення.
 timeout /t 1 /nobreak >nul
 exit /b 0
 
 
 :: ================================================================
-::  SUBROUTINES
+::  ПІДПРОГРАМИ
 :: ================================================================
 
-:: ----------------------------------------------------------------
-:: FN_ENSURE_POSTGRES
-:: ----------------------------------------------------------------
-:FN_ENSURE_POSTGRES
-"%PG_ISREADY%" -h 127.0.0.1 -p %DB_PORT% -q >nul 2>&1
-if not errorlevel 1 (
-    for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%DB_PORT% " ^| findstr "LISTENING"') do echo %%a > "%PID_POSTGRES%"
-    exit /b 0
-)
-for /f "tokens=3" %%s in ('sc query PlanningPostgreSQL 2^>nul ^| findstr "STATE"') do set "_PG_SVC=%%s"
-if "!_PG_SVC!"=="1" (
-    echo   Service STOPPED -- starting PlanningPostgreSQL...
-    net start PlanningPostgreSQL >nul 2>&1
-) else (
-    echo   Service starting or running -- waiting for pg_isready...
-)
-set "_PGW=0"
-:_pg_wait_loop
-"%PG_ISREADY%" -h 127.0.0.1 -p %DB_PORT% -q >nul 2>&1
-if not errorlevel 1 (
-    for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%DB_PORT% " ^| findstr "LISTENING"') do echo %%a > "%PID_POSTGRES%"
-    exit /b 0
-)
-set /a _PGW+=2
-if %_PGW% geq 60 (
-    echo   [!!] PostgreSQL timeout after 60s.
-    sc query PlanningPostgreSQL
-    exit /b 1
-)
-if %_PGW%==10 echo   Waiting for PostgreSQL... (%_PGW%s)
-if %_PGW%==30 echo   Waiting for PostgreSQL... (%_PGW%s)
-if %_PGW%==50 echo   Waiting for PostgreSQL... (%_PGW%s)
-timeout /t 2 /nobreak >nul
-goto _pg_wait_loop
-
-
-:: ----------------------------------------------------------------
-:: FN_START_BACKEND
-:: ----------------------------------------------------------------
-:FN_START_BACKEND
-start "%WIN_BACKEND%" cmd /k "cd /d %WEB_DIR% && call venv\Scripts\activate.bat && echo. && echo  [Backend] http://localhost:%BACKEND_PORT% && python -m uvicorn main:app --host 127.0.0.1 --port %BACKEND_PORT% --reload"
-echo   Waiting for backend HTTP...
-set "_BEW=0"
-:_be_wait_loop
-set "HEALTH_OK=0"
-curl -sf --max-time 2 "http://127.0.0.1:%BACKEND_PORT%/docs" >nul 2>&1
-if not errorlevel 1 set "HEALTH_OK=1"
-if "!HEALTH_OK!"=="0" (
-    powershell -NoProfile -NonInteractive -Command "try{$null=(New-Object Net.WebClient).DownloadString('http://127.0.0.1:%BACKEND_PORT%/docs');exit 0}catch{exit 1}" >nul 2>&1
-    if not errorlevel 1 set "HEALTH_OK=1"
-)
-if "!HEALTH_OK!"=="1" (
-    echo   [OK] Backend ready on port %BACKEND_PORT%
-    exit /b 0
-)
-set /a _BEW+=1
-if %_BEW% geq 30 (
-    echo   [WARN] Backend did not respond, but process may still be starting
-    exit /b 0
-)
-if %_BEW%==10 echo   Still waiting... (%_BEW%s)
-if %_BEW%==20 echo   Still waiting... (%_BEW%s)
-timeout /t 2 /nobreak >nul
-goto _be_wait_loop
-
-
-:: ----------------------------------------------------------------
-:: FN_HEALTH_BACKEND  -- sets HEALTH_OK=1 if OK
-:: ----------------------------------------------------------------
-:FN_HEALTH_BACKEND
-set "HEALTH_OK=0"
-curl -sf --max-time 3 "http://127.0.0.1:%BACKEND_PORT%/docs" >nul 2>&1
-if %errorlevel%==0 (set "HEALTH_OK=1" & exit /b 0)
-powershell -NoProfile -NonInteractive -Command "try{$null=(New-Object Net.WebClient).DownloadString('http://127.0.0.1:%BACKEND_PORT%/docs');exit 0}catch{exit 1}" >nul 2>&1
-if %errorlevel%==0 set "HEALTH_OK=1"
-exit /b 0
-
-
-:: ----------------------------------------------------------------
-:: FN_CAPTURE_BACKEND_PID
-:: ----------------------------------------------------------------
-:FN_CAPTURE_BACKEND_PID
-set "BACKEND_PID=N/A"
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%BACKEND_PORT% " ^| findstr "LISTENING"') do (
-    set "BACKEND_PID=%%a"
-    echo %%a > "%PID_BACKEND%"
-    goto _be_pid_done
-)
-:_be_pid_done
-exit /b 0
-
-
-:: ----------------------------------------------------------------
-:: FN_STOP_BACKEND
-:: ----------------------------------------------------------------
-:FN_STOP_BACKEND
-echo   Stopping backend...
-if exist "%PID_BACKEND%" (
-    set /p _KILL_PID=<"%PID_BACKEND%"
-    if defined _KILL_PID taskkill /PID !_KILL_PID! /T /F >nul 2>&1
-    del "%PID_BACKEND%" >nul 2>&1
-)
-taskkill /FI "WINDOWTITLE eq %WIN_BACKEND%"    /T /F >nul 2>&1
-taskkill /FI "WINDOWTITLE eq Planning Backend" /T /F >nul 2>&1
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%BACKEND_PORT% " ^| findstr "LISTENING"') do (
-    if not "%%a"=="" taskkill /PID %%a /F >nul 2>&1
-)
-call :FN_LOG "Backend stopped"
-exit /b 0
-
-
-:: ----------------------------------------------------------------
-:: FN_START_FRONTEND
-:: ----------------------------------------------------------------
-:FN_START_FRONTEND
-start "%WIN_FRONTEND%" cmd /k "cd /d %FRONTEND_DIR% && echo. && echo  [Frontend] http://localhost:%FRONTEND_PORT% && npm start"
-echo   Waiting for frontend (first compile may take 120s)...
-set "_FEW=0"
-:_fe_wait_loop
-netstat -ano 2>nul | findstr ":%FRONTEND_PORT% " | findstr "LISTENING" >nul 2>&1
+:ENSURE_POSTGRES
+"!PG_ISREADY!" -h 127.0.0.1 -p !DB_PORT! -q >nul 2>&1
 if not errorlevel 1 exit /b 0
-set /a _FEW+=1
-if %_FEW% geq 120 (echo   [!!] Frontend timeout & exit /b 1)
-if %_FEW%==15 echo   Compiling React... (%_FEW%s)
-if %_FEW%==45 echo   Still compiling... (%_FEW%s)
-if %_FEW%==90 echo   Almost there...   (%_FEW%s)
-timeout /t 1 /nobreak >nul
-goto _fe_wait_loop
+set "_SVC=0"
+for /f "tokens=3" %%s in ('sc query PlanningPostgreSQL 2^>nul ^| findstr "STATE"') do set "_SVC=%%s"
+if "!_SVC!"=="1" net start PlanningPostgreSQL >nul 2>&1
+set "_W=0"
+:_pg_loop
+"!PG_ISREADY!" -h 127.0.0.1 -p !DB_PORT! -q >nul 2>&1
+if not errorlevel 1 exit /b 0
+set /a _W+=2
+if !_W! geq 60 exit /b 1
+timeout /t 2 /nobreak >nul
+goto _pg_loop
 
-
-:: ----------------------------------------------------------------
-:: FN_CAPTURE_FRONTEND_PID
-:: ----------------------------------------------------------------
-:FN_CAPTURE_FRONTEND_PID
-set "FRONTEND_PID=N/A"
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%FRONTEND_PORT% " ^| findstr "LISTENING"') do (
-    set "FRONTEND_PID=%%a"
-    echo %%a > "%PID_FRONTEND%"
-    goto _fe_pid_done
-)
-:_fe_pid_done
+:CHECK_BACKEND_HTTP
+set "HEALTH_OK=0"
+curl -sf --max-time 3 "http://127.0.0.1:!BACKEND_PORT!/docs" >nul 2>&1
+if !errorlevel!==0 (set "HEALTH_OK=1" & exit /b 0)
+powershell -NoProfile -NonInteractive -Command "try{$null=(New-Object Net.WebClient).DownloadString('http://127.0.0.1:!BACKEND_PORT!/docs');exit 0}catch{exit 1}" >nul 2>&1
+if !errorlevel!==0 set "HEALTH_OK=1"
 exit /b 0
 
+:START_BACKEND_WINDOW
+start "Metricore Backend" cmd /k "cd /d !WEB_DIR! && call venv\Scripts\activate.bat && python -m uvicorn main:app --host 127.0.0.1 --port !BACKEND_PORT! --reload"
+exit /b 0
 
-:: ----------------------------------------------------------------
-:: FN_STOP_FRONTEND
-:: ----------------------------------------------------------------
-:FN_STOP_FRONTEND
-echo   Stopping frontend...
-if exist "%PID_FRONTEND%" (
-    set /p _KILL_PID=<"%PID_FRONTEND%"
-    if defined _KILL_PID taskkill /PID !_KILL_PID! /T /F >nul 2>&1
-    del "%PID_FRONTEND%" >nul 2>&1
+:WAIT_BACKEND
+set "_BW=0"
+:_be_loop
+call :CHECK_BACKEND_HTTP
+if "!HEALTH_OK!"=="1" exit /b 0
+set /a _BW+=2
+if !_BW! geq 60 exit /b 0
+if !_BW!==10 echo   ще чекаю... ^(!_BW!с^)
+if !_BW!==30 echo   ще чекаю... ^(!_BW!с^)
+timeout /t 2 /nobreak >nul
+goto _be_loop
+
+:STOP_BACKEND
+if exist "!PID_BE!" (
+    set /p _K=<"!PID_BE!"
+    if defined _K taskkill /PID !_K! /T /F >nul 2>&1
+    del "!PID_BE!" >nul 2>&1
 )
-taskkill /FI "WINDOWTITLE eq %WIN_FRONTEND%"    /T /F >nul 2>&1
-taskkill /FI "WINDOWTITLE eq Planning Frontend" /T /F >nul 2>&1
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":%FRONTEND_PORT% " ^| findstr "LISTENING"') do (
+taskkill /FI "WINDOWTITLE eq Metricore Backend" /T /F >nul 2>&1
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":!BACKEND_PORT! " ^| findstr "LISTENING"') do (
     if not "%%a"=="" taskkill /PID %%a /F >nul 2>&1
 )
-call :FN_LOG "Frontend stopped"
 exit /b 0
 
+:CHECK_FRONTEND
+set "FE_RUNNING=0"
+netstat -ano 2>nul | findstr ":!FRONTEND_PORT! " | findstr "LISTENING" >nul 2>&1
+if !errorlevel!==0 set "FE_RUNNING=1"
+exit /b 0
 
-:: ----------------------------------------------------------------
-:: FN_RELOAD_NGINX  -- sets NGINX_OK=1/0
-:: ----------------------------------------------------------------
-:FN_RELOAD_NGINX
-set "NGINX_OK=0"
-if exist "%NGINX_EXE%" (
-    "%NGINX_EXE%" -s reload >nul 2>&1
-    if !errorlevel!==0 set "NGINX_OK=1"
-    exit /b 0
+:START_FRONTEND_WINDOW
+start "Metricore Frontend" cmd /k "cd /d !FRONT_DIR! && npm start"
+exit /b 0
+
+:WAIT_FRONTEND
+set "_FW=0"
+:_fe_loop
+netstat -ano 2>nul | findstr ":!FRONTEND_PORT! " | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 (set "FE_RUNNING=1" & exit /b 0)
+set /a _FW+=1
+if !_FW! geq 120 exit /b 0
+if !_FW!==20 echo   компілюю React... ^(!_FW!с^)
+if !_FW!==60 echo   ще компілюю... ^(!_FW!с^)
+timeout /t 1 /nobreak >nul
+goto _fe_loop
+
+:STOP_FRONTEND
+if exist "!PID_FE!" (
+    set /p _K=<"!PID_FE!"
+    if defined _K taskkill /PID !_K! /T /F >nul 2>&1
+    del "!PID_FE!" >nul 2>&1
 )
-nginx -s reload >nul 2>&1
-if !errorlevel!==0 set "NGINX_OK=1"
+taskkill /FI "WINDOWTITLE eq Metricore Frontend" /T /F >nul 2>&1
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":!FRONTEND_PORT! " ^| findstr "LISTENING"') do (
+    if not "%%a"=="" taskkill /PID %%a /F >nul 2>&1
+)
 exit /b 0
 
+:WRITE_NGINX_CONF
+set "_P=%~1"
+set "_F=%~2"
+set "_T=%~3"
+if exist "!_P!" del "!_P!" >nul 2>&1
+>> "!_P!" echo worker_processes  1;
+>> "!_P!" echo(
+>> "!_P!" echo events {
+>> "!_P!" echo     worker_connections  1024;
+>> "!_P!" echo }
+>> "!_P!" echo(
+>> "!_P!" echo http {
+>> "!_P!" echo     include       mime.types;
+>> "!_P!" echo     default_type  application/octet-stream;
+>> "!_P!" echo     sendfile        on;
+>> "!_P!" echo     keepalive_timeout  65;
+>> "!_P!" echo(
+>> "!_P!" echo     server {
+>> "!_P!" echo         listen 80;
+>> "!_P!" echo         server_name localhost 127.0.0.1 metricore.com.ua www.metricore.com.ua;
+>> "!_P!" echo         client_max_body_size 100M;
+>> "!_P!" echo(
+>> "!_P!" echo         location /static/ {
+>> "!_P!" echo             alias !_F!/static/;
+>> "!_P!" echo             add_header Cache-Control "public, max-age=31536000, immutable";
+>> "!_P!" echo         }
+>> "!_P!" echo(
+>> "!_P!" echo         location /api/ {
+>> "!_P!" echo             proxy_pass http://127.0.0.1:!_T!;
+>> "!_P!" echo             proxy_set_header Host $host;
+>> "!_P!" echo             proxy_set_header X-Real-IP $remote_addr;
+>> "!_P!" echo         }
+>> "!_P!" echo(
+>> "!_P!" echo         location /docs {
+>> "!_P!" echo             proxy_pass http://127.0.0.1:!_T!/docs;
+>> "!_P!" echo             proxy_set_header Host $host;
+>> "!_P!" echo         }
+>> "!_P!" echo(
+>> "!_P!" echo         location /openapi.json {
+>> "!_P!" echo             proxy_pass http://127.0.0.1:!_T!/openapi.json;
+>> "!_P!" echo             proxy_set_header Host $host;
+>> "!_P!" echo         }
+>> "!_P!" echo(
+>> "!_P!" echo         location / {
+>> "!_P!" echo             root !_F!;
+>> "!_P!" echo             try_files $uri /index.html;
+>> "!_P!" echo             add_header Cache-Control "no-cache, no-store, must-revalidate";
+>> "!_P!" echo             add_header Pragma "no-cache";
+>> "!_P!" echo             add_header Expires "0";
+>> "!_P!" echo         }
+>> "!_P!" echo     }
+>> "!_P!" echo }
+exit /b 0
 
-:: ----------------------------------------------------------------
-:: FN_LOG  -- append timestamped line to log file
-:: ----------------------------------------------------------------
-:FN_LOG
+:LOG
 set "_L=%~1"
-for /f "tokens=2 delims==" %%i in ('wmic os get localdatetime /format:value 2^>nul') do set "_WD=%%i"
-set "_TS=!_WD:~0,4!-!_WD:~4,2!-!_WD:~6,2! !_WD:~8,2!:!_WD:~10,2!:!_WD:~12,2!"
-echo [!_TS!] !_L! >> "%LOG_FILE%"
+for /f "tokens=2 delims==" %%i in ('wmic os get localdatetime /format:value 2^>nul') do set "_D=%%i"
+echo [!_D:~0,4!-!_D:~4,2!-!_D:~6,2! !_D:~8,2!:!_D:~10,2!] !_L! >> "!LOG_FILE!"
 exit /b 0

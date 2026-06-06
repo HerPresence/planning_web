@@ -619,13 +619,15 @@ def get_masters(_u=Depends(get_current_user)):
     cur = conn.cursor()
     try:
         cur.execute(
-            """SELECT id, brand_uid, brand_name, brand_group
+            """SELECT id, brand_uid, brand_name, brand_group,
+                      COALESCE(normalized_name, '') AS normalized_name
                FROM dim_brand
                WHERE is_active = TRUE
                ORDER BY brand_name"""
         )
         return [
-            {"id": r[0], "brand_uid": r[1], "brand_name": r[2], "brand_group": r[3]}
+            {"id": r[0], "brand_uid": r[1], "brand_name": r[2], "brand_group": r[3],
+             "normalized_name": r[4]}
             for r in cur.fetchall()
         ]
     finally:
@@ -1755,3 +1757,324 @@ def bulk_auto_bind(body: BulkAutoBindRequest, _u=Depends(get_current_user)):
     finally:
         cur.close()
         conn.close()
+
+
+# ── Brand Conflict Detection ────────────────────────────────────────────────────
+# Normalized brand name (applied to dbs.source_brand_name): UPPER + remove quotes + collapse spaces
+_BRAND_NORM_SQL = (
+    "UPPER(TRIM("
+    "  REGEXP_REPLACE("
+    "    REGEXP_REPLACE("
+    "      COALESCE(dbs.source_brand_name,''),"
+    r"      '[\"''«»""''`]', '', 'g'"
+    "    ),"
+    r"    '\s+', ' ', 'g'"
+    "  )"
+    "))"
+)
+
+
+class BulkRemapBrandsItem(BaseModel):
+    source_id:       int
+    source_brand_id: str
+
+
+class BulkRemapBrandsRequest(BaseModel):
+    items:         List[BulkRemapBrandsItem]
+    new_master_id: int
+    reason:        str  = "bulk_conflict_remap"
+    dry_run:       bool = True
+
+
+@router.get("/brand-conflicts")
+def get_brand_conflicts(
+    source_id:  Optional[int] = None,
+    search:     Optional[str] = None,
+    page:       int = 1,
+    page_size:  int = 20,
+    _u=Depends(get_current_user),
+):
+    """
+    Groups of source brands with same normalized name mapped to different master brands.
+    Sorted by revenue DESC. Server-side pagination + search.
+    """
+    _ensure_brand_columns()
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        filters = [
+            "bsm.mapping_status IN ('mapped','auto')",
+            "bsm.master_brand_id IS NOT NULL",
+            "COALESCE(dbs.is_active, TRUE) = TRUE",
+        ]
+        params: list = []
+
+        if source_id:
+            filters.append("dbs.source_id = %s"); params.append(source_id)
+        if search and search.strip():
+            s = f"%{search.strip()}%"
+            filters.append(
+                f"({_BRAND_NORM_SQL} ILIKE %s OR dbs.source_brand_id ILIKE %s)"
+            )
+            params.extend([s, s])
+
+        where = " AND ".join(filters)
+
+        # Global count (unfiltered) — for the badge pill
+        cur.execute(
+            f"""SELECT COUNT(*) FROM (
+                SELECT {_BRAND_NORM_SQL} AS nn
+                FROM dim_brand_source dbs
+                JOIN brand_source_mapping bsm
+                  ON bsm.source_id = dbs.source_id
+                 AND bsm.source_brand_id = dbs.source_brand_id
+                WHERE bsm.mapping_status IN ('mapped','auto')
+                  AND bsm.master_brand_id IS NOT NULL
+                  AND COALESCE(dbs.is_active, TRUE) = TRUE
+                  AND {_BRAND_NORM_SQL} <> ''
+                GROUP BY {_BRAND_NORM_SQL}
+                HAVING COUNT(DISTINCT bsm.master_brand_id) > 1
+            ) s""",
+            [],
+        )
+        total_global = int(cur.fetchone()[0])
+
+        # Filtered count for pagination
+        cur.execute(
+            f"""SELECT COUNT(*) FROM (
+                SELECT {_BRAND_NORM_SQL} AS nn
+                FROM dim_brand_source dbs
+                JOIN brand_source_mapping bsm
+                  ON bsm.source_id = dbs.source_id
+                 AND bsm.source_brand_id = dbs.source_brand_id
+                WHERE {where} AND {_BRAND_NORM_SQL} <> ''
+                GROUP BY {_BRAND_NORM_SQL}
+                HAVING COUNT(DISTINCT bsm.master_brand_id) > 1
+            ) s""",
+            params,
+        )
+        total_groups = int(cur.fetchone()[0])
+
+        offset = (max(page, 1) - 1) * page_size
+        cur.execute(
+            f"""SELECT
+                    {_BRAND_NORM_SQL}                          AS norm_name,
+                    COUNT(*)                                    AS rows_count,
+                    COUNT(DISTINCT bsm.master_brand_id)        AS distinct_masters,
+                    ARRAY_AGG(DISTINCT bsm.master_brand_id)    AS master_ids,
+                    ARRAY_AGG(DISTINCT dbs.source_id)          AS source_ids,
+                    COALESCE(SUM(ft_a.sv), 0)                  AS sales_amount,
+                    COALESCE(SUM(ft_a.fr), 0)                  AS fact_rows_sum
+                FROM dim_brand_source dbs
+                JOIN brand_source_mapping bsm
+                  ON bsm.source_id = dbs.source_id
+                 AND bsm.source_brand_id = dbs.source_brand_id
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(ABS(ft.sales_vat)),0) AS sv, COUNT(*) AS fr
+                    FROM fact_turnover ft
+                    WHERE ft.product_group_uid = dbs.source_brand_id
+                      AND ft.source_id = dbs.source_id
+                ) ft_a ON TRUE
+                WHERE {where} AND {_BRAND_NORM_SQL} <> ''
+                GROUP BY {_BRAND_NORM_SQL}
+                HAVING COUNT(DISTINCT bsm.master_brand_id) > 1
+                ORDER BY COALESCE(SUM(ft_a.sv),0) DESC, rows_count DESC
+                LIMIT %s OFFSET %s""",
+            params + [page_size, offset],
+        )
+        groups_raw = cur.fetchall()
+
+        groups = []
+        for (norm_name, rows_count, distinct_masters,
+             master_ids, source_ids, sales_amount, fact_rows_sum) in groups_raw:
+
+            master_ids_clean = [m for m in (master_ids or []) if m is not None]
+
+            cur.execute(
+                """SELECT id, brand_name, brand_uid, brand_group, normalized_name, is_active
+                   FROM dim_brand WHERE id = ANY(%s)""",
+                (master_ids_clean,),
+            )
+            master_full = {r[0]: r for r in cur.fetchall()}
+
+            master_info = []
+            for mid in master_ids_clean:
+                mf = master_full.get(mid)
+                cur.execute(
+                    f"""SELECT COUNT(*),
+                               COALESCE(SUM(ft_a.sv), 0),
+                               COALESCE(SUM(ft_a.fr), 0)
+                        FROM dim_brand_source dbs
+                        JOIN brand_source_mapping bsm
+                          ON bsm.source_id = dbs.source_id
+                         AND bsm.source_brand_id = dbs.source_brand_id
+                        LEFT JOIN LATERAL (
+                            SELECT COALESCE(SUM(ABS(ft.sales_vat)),0) AS sv,
+                                   COUNT(*) AS fr
+                            FROM fact_turnover ft
+                            WHERE ft.product_group_uid = dbs.source_brand_id
+                              AND ft.source_id = dbs.source_id
+                        ) ft_a ON TRUE
+                        WHERE {where}
+                          AND {_BRAND_NORM_SQL} = %s
+                          AND bsm.master_brand_id = %s""",
+                    params + [norm_name, mid],
+                )
+                cnt = cur.fetchone()
+                master_info.append({
+                    "master_id":       mid,
+                    "master_name":     mf[1] if mf else str(mid),
+                    "brand_uid":       mf[2] if mf else None,
+                    "brand_group":     mf[3] if mf else None,
+                    "normalized_name": mf[4] if mf else None,
+                    "is_active":       bool(mf[5]) if mf else True,
+                    "rows_count":      int(cnt[0]) if cnt else 0,
+                    "sales_amount":    float(cnt[1]) if cnt else 0.0,
+                    "fact_rows":       int(cnt[2]) if cnt else 0,
+                })
+
+            cur.execute(
+                f"""SELECT dbs.source_id,
+                           dbs.source_brand_id,
+                           dbs.source_brand_name,
+                           COALESCE(dbs.source_brand_group,''),
+                           bsm.master_brand_id,
+                           COALESCE(db.brand_name,'') AS master_name,
+                           bsm.mapping_status
+                    FROM dim_brand_source dbs
+                    JOIN brand_source_mapping bsm
+                      ON bsm.source_id = dbs.source_id
+                     AND bsm.source_brand_id = dbs.source_brand_id
+                    LEFT JOIN dim_brand db ON db.id = bsm.master_brand_id
+                    WHERE {where} AND {_BRAND_NORM_SQL} = %s
+                    ORDER BY dbs.source_id LIMIT 50""",
+                params + [norm_name],
+            )
+            source_rows = [
+                {
+                    "source_id":          r[0],
+                    "source_brand_id":    r[1],
+                    "source_brand_name":  r[2],
+                    "source_brand_group": r[3],
+                    "master_id":          r[4],
+                    "master_name":        r[5],
+                    "mapping_status":     r[6],
+                }
+                for r in cur.fetchall()
+            ]
+
+            groups.append({
+                "norm_name":        norm_name,
+                "rows_count":       int(rows_count),
+                "distinct_masters": int(distinct_masters),
+                "master_info":      master_info,
+                "affected_sources": [int(s) for s in (source_ids or []) if s],
+                "sales_amount":     float(sales_amount),
+                "fact_rows":        int(fact_rows_sum),
+                "source_rows":      source_rows,
+            })
+
+        return {
+            "total_groups":       total_groups,
+            "conflict_count_all": total_global,
+            "page":               page,
+            "page_size":          page_size,
+            "groups":             groups,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+    finally:
+        cur.close(); conn.close()
+
+
+@router.post("/bulk-remap-brands")
+def bulk_remap_brands(body: BulkRemapBrandsRequest, _u=Depends(get_current_user)):
+    """Remap source brands to a new master brand. dry_run=True → preview only."""
+    _ensure_brand_columns()
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT brand_name FROM dim_brand WHERE id = %s AND COALESCE(is_active, TRUE) = TRUE",
+            (body.new_master_id,),
+        )
+        master_row = cur.fetchone()
+        if not master_row:
+            raise HTTPException(404, f"Master brand {body.new_master_id} not found")
+
+        preview_rows = []
+        for item in body.items:
+            cur.execute(
+                """SELECT bsm.master_brand_id,
+                          COALESCE(db.brand_name,'') AS old_name,
+                          bsm.mapping_status,
+                          COALESCE((
+                              SELECT SUM(ABS(ft.sales_vat))
+                              FROM fact_turnover ft
+                              WHERE ft.product_group_uid = bsm.source_brand_id
+                                AND ft.source_id = bsm.source_id
+                          ), 0) AS sales_vat
+                   FROM brand_source_mapping bsm
+                   LEFT JOIN dim_brand db ON db.id = bsm.master_brand_id
+                   WHERE bsm.source_id = %s AND bsm.source_brand_id = %s""",
+                (item.source_id, item.source_brand_id),
+            )
+            row = cur.fetchone()
+            if not row or row[2] == "rejected":
+                continue
+            preview_rows.append({
+                "source_id":       item.source_id,
+                "source_brand_id": item.source_brand_id,
+                "old_master_id":   row[0],
+                "old_master_name": row[1],
+                "new_master_name": master_row[0],
+                "mapping_status":  row[2],
+                "sales_vat":       float(row[3]),
+            })
+
+        if body.dry_run:
+            return {
+                "dry_run":         True,
+                "rows_affected":   len(preview_rows),
+                "new_master_name": master_row[0],
+                "preview":         preview_rows,
+            }
+
+        remapped = 0
+        for r in preview_rows:
+            cur.execute(
+                """UPDATE brand_source_mapping
+                   SET master_brand_id = %s,
+                       mapping_status  = 'mapped',
+                       confidence      = 100,
+                       mapped_by       = %s,
+                       updated_at      = NOW()
+                   WHERE source_id = %s AND source_brand_id = %s
+                     AND mapping_status != 'rejected'""",
+                (body.new_master_id, _u["id"],
+                 r["source_id"], r["source_brand_id"]),
+            )
+            remapped += cur.rowcount
+
+        conn.commit()
+        log_action(
+            action="brand_bulk_remap",
+            user_id=_u["id"],
+            user_email=_u.get("email"),
+            entity_type="brand_source_mapping",
+            entity_id=str(body.new_master_id),
+            menu_key="brand_correspondence",
+            new_value={"remapped": remapped, "reason": body.reason},
+        )
+        return {
+            "dry_run":         False,
+            "rows_remapped":   remapped,
+            "new_master_name": master_row[0],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(500, str(exc))
+    finally:
+        cur.close(); conn.close()

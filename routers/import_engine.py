@@ -4,8 +4,11 @@ New routes: /api/import-engine/...
 Existing /api/pnl-import/... routes are untouched.
 """
 
+import logging
 from datetime import date, datetime
 from typing import List, Optional
+
+logger = logging.getLogger("import_engine")
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -148,11 +151,14 @@ def save_mapping(source_id: int, body: FieldMappingBody, _u=Depends(get_current_
 
 @router.post("/preview/{source_id}")
 def preview_source(source_id: int, _u=Depends(get_current_user)):
+    print(f"OLAP_DEBUG_ACTIVE  source_id={source_id}", flush=True)
+    logger.warning("ENDPOINT_HIT preview_source source_id=%s", source_id)
+
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute(
-            "SELECT source_type FROM import_sources WHERE id = %s AND is_active = TRUE",
+            "SELECT source_type, source_name FROM import_sources WHERE id = %s AND is_active = TRUE",
             (source_id,),
         )
         row = cur.fetchone()
@@ -164,6 +170,9 @@ def preview_source(source_id: int, _u=Depends(get_current_user)):
         raise HTTPException(404, "Source not found")
 
     source_type = row[0] or "olap_ssas_dax"
+    source_name = row[1] or ""
+    print(f"OLAP_DEBUG  source_name={source_name!r}  source_type={source_type!r}")
+
     try:
         if source_type in ("olap_ssas_dax", "olap_sql"):
             rows, _ = _read_ssas_dax(source_id)
@@ -174,6 +183,9 @@ def preview_source(source_id: int, _u=Depends(get_current_user)):
     except HTTPException:
         raise
     except Exception as exc:
+        import traceback as _tb
+        print(f"OLAP_DEBUG  EXCEPTION type={type(exc).__name__}  msg={exc}")
+        print(f"OLAP_DEBUG  TRACEBACK:\n{_tb.format_exc()}")
         raise HTTPException(500, str(exc))
 
     if not rows:
@@ -202,6 +214,8 @@ def load_to_staging(
     period_from and period_to are required for sales_fact to avoid loading full history.
     Returns batch_id and staging summary.
     """
+    print(f"REAL_OLAP_ENDPOINT_HIT  source_id={source_id}  period_from={period_from!r}  period_to={period_to!r}", flush=True)
+    logger.warning("ENDPOINT_HIT load_to_staging source_id=%s period_from=%s period_to=%s", source_id, period_from, period_to)
     conn = get_connection()
     cur = conn.cursor()
     try:

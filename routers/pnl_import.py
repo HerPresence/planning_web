@@ -3,6 +3,9 @@ import io
 import json
 import os
 import subprocess
+import sys
+import tempfile
+import traceback
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -298,8 +301,14 @@ def _build_mssql_conn_str(db_server, db_port, db_database, db_login, db_password
 # ── SSAS Tabular / DAX via PowerShell + ADOMD.NET ────────────────────────────
 
 def _run_ssas_ps(db_server, db_port, db_database, db_login, db_password,
-                 db_query, max_rows: int = 0) -> dict:
-    """Call read_ssas_dax.ps1 via subprocess; return parsed JSON dict."""
+                 db_query, max_rows: int = 0, source_label: str = "") -> dict:
+    """Call read_ssas_dax.ps1 via subprocess; return parsed JSON dict.
+
+    The DAX query is written to a temp file and passed via -QueryFile to avoid:
+    - Windows command-line length limits (32K chars)
+    - Newline/encoding issues in quoted arguments that cause PowerShell to
+      crash before writing output, producing WinError 233 on the Python side.
+    """
     if not os.path.isfile(_PS_SSAS_SCRIPT):
         raise FileNotFoundError(
             f"PowerShell SSAS script not found: {_PS_SSAS_SCRIPT}. "
@@ -307,72 +316,142 @@ def _run_ssas_ps(db_server, db_port, db_database, db_login, db_password,
         )
 
     server = f"{db_server}:{db_port}" if db_port else db_server
-    cmd = [
-        "powershell.exe",
-        "-NoProfile", "-NonInteractive",
-        "-ExecutionPolicy", "Bypass",
-        "-File", _PS_SSAS_SCRIPT,
-        "-Server", server,
-        "-Database", db_database,
-        "-Query", db_query,
-    ]
-    if db_login:
-        cmd += ["-Login", db_login]
-    if db_password:
-        cmd += ["-Password", db_password]
-    if max_rows > 0:
-        cmd += ["-MaxRows", str(max_rows)]
 
-    print(f"[SSAS-DAX] PS  server={server!r}  catalog={db_database!r}")
-    print(f"[SSAS-DAX] query ({len(db_query)} chars): {db_query[:150]}...")
-
+    # All three temp files are tracked here so the finally block can delete them.
+    query_file  = None
+    stdout_file = None
+    stderr_file = None
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=130,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "powershell.exe не знайдено. Переконайтесь, що backend запущено на Windows."
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("PowerShell SSAS script перевищив таймаут (130 с).")
-
-    stdout = (proc.stdout or "").strip()
-    stderr = (proc.stderr or "").strip()
-
-    if not stdout:
-        raise RuntimeError(
-            f"PowerShell не повернув жодних даних (exit {proc.returncode}).\n"
-            f"stderr: {stderr[:400]}"
+        # ---- STEP 1: create temp files ----
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".dax", delete=False, encoding="utf-8"
+        ) as tf:
+            tf.write(db_query)
+            query_file = tf.name
+        # stdout/stderr written to files instead of pipes — eliminates WinError 233
+        # which occurs when subprocess.run uses PIPE handles that the Windows process
+        # manager invalidates when the parent has no console (uvicorn runs headless).
+        with tempfile.NamedTemporaryFile(suffix=".out", delete=False) as tf:
+            stdout_file = tf.name
+        with tempfile.NamedTemporaryFile(suffix=".err", delete=False) as tf:
+            stderr_file = tf.name
+        print(
+            f"[SSAS-DAX] STEP1 query_file={query_file!r}  "
+            f"exists={os.path.isfile(query_file)}  size={os.path.getsize(query_file)}  "
+            f"stdout_file={stdout_file!r}  stderr_file={stderr_file!r}"
         )
 
-    # stdout may have debug Write-Host lines before the JSON — find the JSON object
-    json_line = ""
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            json_line = line
-            break
+        # ---- STEP 2: build command ----
+        cmd = [
+            "powershell.exe",
+            "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass",
+            "-File", _PS_SSAS_SCRIPT,
+            "-Server", server,
+            "-Database", db_database,
+            "-QueryFile", query_file,
+        ]
+        if db_login:
+            cmd += ["-Login", db_login]
+        if db_password:
+            cmd += ["-Password", db_password]
+        if max_rows > 0:
+            cmd += ["-MaxRows", str(max_rows)]
 
-    if not json_line:
-        raise RuntimeError(
-            f"PowerShell не повернув JSON (exit {proc.returncode}).\n"
-            f"stdout: {stdout[:400]}"
-        )
+        print(f"[SSAS-DAX] source={source_label!r}  server={server!r}  catalog={db_database!r}")
+        print(f"[SSAS-DAX] query ({len(db_query)} chars): {db_query[:200]}...")
+        print(f"[SSAS-DAX] STEP2 ps_script={_PS_SSAS_SCRIPT!r}  script_exists={os.path.isfile(_PS_SSAS_SCRIPT)}")
+        print(f"[SSAS-DAX] STEP2 cmd={cmd}")
+        print(f"[SSAS-DAX] STEP2 platform={sys.platform}")
 
-    try:
-        data = json.loads(json_line)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"PowerShell повернув невалідний JSON: {exc}\nraw: {json_line[:300]}"
-        )
+        # ---- STEP 3: run process, output to temp files (no pipes) ----
+        create_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        print(f"[SSAS-DAX] STEP3 starting Popen with file output  platform={sys.platform}")
+        try:
+            with open(stdout_file, "wb") as out_fh, open(stderr_file, "wb") as err_fh:
+                proc = subprocess.Popen(cmd, stdout=out_fh, stderr=err_fh, creationflags=create_flags)
+            print(f"[SSAS-DAX] STEP3 Popen started  pid={proc.pid}")
+            try:
+                returncode = proc.wait(timeout=130)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise RuntimeError("PowerShell SSAS script перевищив таймаут (130 с).")
+        except FileNotFoundError:
+            raise RuntimeError(
+                "powershell.exe не знайдено. Переконайтесь, що backend запущено на Windows."
+            )
+        except RuntimeError:
+            raise
+        except OSError as exc:
+            tb = traceback.format_exc()
+            raise RuntimeError(
+                f"[SSAS-DAX] STEP3 FAILED Popen OSError "
+                f"(WinError {exc.winerror if hasattr(exc, 'winerror') else '?'}): {exc}\n"
+                f"source={source_label!r}  server={server!r}  catalog={db_database!r}\n"
+                f"traceback:\n{tb}"
+            )
+        except Exception as exc:
+            tb = traceback.format_exc()
+            raise RuntimeError(
+                f"[SSAS-DAX] STEP3 FAILED Popen unexpected {type(exc).__name__}: {exc}\n"
+                f"traceback:\n{tb}"
+            )
+        print(f"[SSAS-DAX] STEP3 process done  returncode={returncode}")
 
-    return data
+        # ---- STEP 4: read output files and parse ----
+        with open(stdout_file, "r", encoding="utf-8", errors="replace") as f:
+            stdout = f.read().strip()
+        with open(stderr_file, "r", encoding="utf-8", errors="replace") as f:
+            stderr = f.read().strip()
+
+        print(f"[SSAS-DAX] STEP4 exit={returncode}  stdout_len={len(stdout)}  stderr_len={len(stderr)}")
+        if stderr:
+            print(f"[SSAS-DAX] STEP4 stderr: {stderr[:800]}")
+        if stdout:
+            print(f"[SSAS-DAX] STEP4 stdout first 400: {stdout[:400]}")
+
+        if not stdout:
+            raise RuntimeError(
+                f"PowerShell не повернув жодних даних (exit {returncode}).\n"
+                f"source={source_label!r}  server={server!r}  catalog={db_database!r}\n"
+                f"query_chars={len(db_query)}  query_file_used={query_file!r}\n"
+                f"stderr: {stderr[:600]}"
+            )
+
+        json_line = ""
+        for line in reversed(stdout.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                json_line = line
+                break
+
+        if not json_line:
+            raise RuntimeError(
+                f"PowerShell не повернув JSON (exit {returncode}).\n"
+                f"source={source_label!r}  server={server!r}\n"
+                f"stdout (last 600): {stdout[-600:]}"
+            )
+
+        try:
+            data = json.loads(json_line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"PowerShell повернув невалідний JSON: {exc}\n"
+                f"source={source_label!r}\n"
+                f"raw: {json_line[:400]}"
+            )
+
+        return data
+
+    finally:
+        for _path in (query_file, stdout_file, stderr_file):
+            if _path:
+                try:
+                    os.unlink(_path)
+                except OSError:
+                    pass
+        print("[SSAS-DAX] temp files cleaned up")
 
 
 def _read_ssas_dax(source_id: int) -> tuple:
@@ -383,24 +462,47 @@ def _read_ssas_dax(source_id: int) -> tuple:
 
     db_server, db_port, db_database, db_cube_model, db_login, db_password, db_query = cfg
 
-    if not db_server:
-        raise ValueError("db_server не вказано у налаштуваннях джерела")
-    if not db_database:
-        raise ValueError("db_database (Initial Catalog) не вказано у налаштуваннях джерела")
-    if not db_query:
-        raise ValueError("db_query (DAX) не вказано у налаштуваннях джерела")
+    # Fetch display name for logging (separate query to avoid changing cfg tuple)
+    conn_n = get_connection(); cur_n = conn_n.cursor()
+    try:
+        cur_n.execute("SELECT source_name FROM import_sources WHERE id = %s", (source_id,))
+        row_n = cur_n.fetchone()
+    finally:
+        cur_n.close(); conn_n.close()
+    source_name  = (row_n[0] if row_n else "") or ""
+    source_label = f"id={source_id} name={source_name!r}"
 
-    data = _run_ssas_ps(db_server, db_port, db_database, db_login, db_password, db_query)
+    print(f"[SSAS-DAX] _read_ssas_dax: {source_label}")
+    print(f"[SSAS-DAX] server={db_server!r}  database={db_database!r}")
+
+    if not db_server:
+        raise ValueError(f"[{source_label}] db_server не вказано у налаштуваннях джерела")
+    if not db_database:
+        raise ValueError(f"[{source_label}] db_database (Initial Catalog) не вказано у налаштуваннях джерела")
+    if not db_query:
+        raise ValueError(f"[{source_label}] db_query (DAX) не вказано у налаштуваннях джерела")
+
+    print(f"[SSAS-DAX] query ({len(db_query)} chars): {db_query[:200]}...")
+
+    try:
+        data = _run_ssas_ps(
+            db_server, db_port, db_database, db_login, db_password,
+            db_query, source_label=source_label,
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        print(f"[SSAS-DAX] FAILED for {source_label}:\n{tb}")
+        raise
 
     if "error" in data:
         raise RuntimeError(
-            f"SSAS DAX помилка ({db_server}/{db_database}): {data['error']}\n"
+            f"SSAS DAX помилка [{source_label}] ({db_server}/{db_database}): {data['error']}\n"
             f"Перевірте: сервер доступний (порт 2383/2382), каталог '{db_database}' існує в SSAS."
         )
 
     columns = data.get("columns", [])
     rows = data.get("rows", [])
-    print(f"[SSAS-DAX] {len(rows)} рядків, колонки: {columns}")
+    print(f"[SSAS-DAX] success: {len(rows)} рядків, колонки: {columns}")
     return rows, []
 
 

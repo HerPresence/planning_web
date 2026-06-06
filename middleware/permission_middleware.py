@@ -19,6 +19,7 @@ from db import get_connection
 _PUBLIC_PREFIXES = (
     "/api/auth/",
     "/api/me",
+    "/api/system/",
     "/static",
     "/favicon",
 )

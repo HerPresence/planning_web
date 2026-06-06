@@ -3,11 +3,11 @@ import io
 from datetime import datetime
 from fastapi import APIRouter, Form, HTTPException, Depends
 from fastapi.responses import StreamingResponse
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 from db import get_connection
 from services.article_import_service import ensure_article_columns
-from auth.dependencies import get_current_user
+from auth.dependencies import get_current_user, require_admin
 
 router = APIRouter(prefix="/api/articles")
 
@@ -250,6 +250,21 @@ def get_articles(
             "kpi":           kpi_global,
             "filter_values": filter_values,
         }
+    finally:
+        cur.close()
+        conn.close()
+
+
+@router.get("/{article_id}")
+def get_article_by_id(article_id: str):
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        art = _get_article(cur, article_id)
+        if not art:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Article not found")
+        return art
     finally:
         cur.close()
         conn.close()
@@ -726,5 +741,182 @@ def export_csv(body: ExportCsvRequest, _u=Depends(get_current_user)):
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+    finally:
+        cur.close(); conn.close()
+
+
+# ── Bulk fill ─────────────────────────────────────────────────────────────────
+
+_BULK_FILL_COLS = {
+    "pnl_id":              "pnl_id",
+    "article_name":        "article_name",
+    "level2":              "level2",
+    "level1":              "level1",
+    "article_type":        "article_type",
+    "uid_expense_article": "uid_expense_article",
+    "expense_element":     "expense_element",
+    "expense_company":     "expense_company",
+}
+
+
+class BulkFillFilters(BaseModel):
+    search:               Optional[str] = None
+    article_type:         Optional[str] = None
+    is_active:            Optional[str] = None
+    level1:               Optional[str] = None
+    level2:               Optional[str] = None
+    pnl_id:               Optional[int] = None
+    uid_expense_article:  Optional[str] = None
+    expense_element:      Optional[str] = None
+    expense_company:      Optional[str] = None
+    level1_olap:          Optional[str] = None
+    level2_olap:          Optional[str] = None
+    only_with_uid:        bool = False
+    only_without_uid:     bool = False
+    only_without_element: bool = False
+    only_dup_name:        bool = False
+    only_dup_uid:         bool = False
+    hide_merged:          bool = True
+
+
+class BulkFillRequest(BaseModel):
+    article_ids: List[str]       = []
+    filters:     BulkFillFilters  = BulkFillFilters()
+    scope:       str              = "selected"
+    updates:     Dict[str, Any]   = {}
+
+
+def _build_bulk_where(f: BulkFillFilters):
+    where  = ["1=1"]
+    params = []
+    if f.search:
+        where.append(
+            "(article_id ILIKE %s OR article_name ILIKE %s OR "
+            " uid_expense_article ILIKE %s OR expense_element ILIKE %s OR "
+            " expense_company ILIKE %s OR level1_olap ILIKE %s OR level2_olap ILIKE %s)"
+        )
+        p = f"%{f.search}%"
+        params.extend([p, p, p, p, p, p, p])
+    if f.article_type:
+        where.append("article_type = %s");        params.append(f.article_type)
+    if f.is_active:
+        where.append("is_active = %s");           params.append(f.is_active.lower() == "true")
+    if f.level1:
+        where.append("level1 ILIKE %s");          params.append(f"%{f.level1}%")
+    if f.level2:
+        where.append("level2 ILIKE %s");          params.append(f"%{f.level2}%")
+    if f.pnl_id:
+        where.append("pnl_id = %s");              params.append(f.pnl_id)
+    if f.uid_expense_article:
+        where.append("uid_expense_article ILIKE %s"); params.append(f"%{f.uid_expense_article}%")
+    if f.expense_element:
+        where.append("expense_element ILIKE %s"); params.append(f"%{f.expense_element}%")
+    if f.expense_company:
+        where.append("expense_company = %s");     params.append(f.expense_company)
+    if f.level1_olap:
+        where.append("level1_olap ILIKE %s");     params.append(f"%{f.level1_olap}%")
+    if f.level2_olap:
+        where.append("level2_olap ILIKE %s");     params.append(f"%{f.level2_olap}%")
+    if f.only_with_uid:
+        where.append("uid_expense_article IS NOT NULL AND uid_expense_article <> ''")
+    if f.only_without_uid:
+        where.append("(uid_expense_article IS NULL OR uid_expense_article = '')")
+    if f.only_without_element:
+        where.append("(expense_element IS NULL OR expense_element = '')")
+    if f.only_dup_name:
+        where.append(
+            "LOWER(article_name) IN ("
+            "  SELECT LOWER(article_name) FROM dim_article"
+            "  GROUP BY LOWER(article_name) HAVING COUNT(*) > 1)"
+        )
+    if f.only_dup_uid:
+        where.append(
+            "uid_expense_article IS NOT NULL AND uid_expense_article <> '' AND "
+            "uid_expense_article IN ("
+            "  SELECT uid_expense_article FROM dim_article"
+            "  WHERE uid_expense_article IS NOT NULL AND uid_expense_article <> ''"
+            "  GROUP BY uid_expense_article HAVING COUNT(*) > 1)"
+        )
+    if f.hide_merged:
+        where.append("(merged_into_article_id IS NULL OR merged_into_article_id = '')")
+    return where, params
+
+
+def _validate_bulk(body: BulkFillRequest):
+    if not body.updates:
+        raise HTTPException(400, "Не вибрано жодного поля для оновлення")
+    unknown = set(body.updates.keys()) - set(_BULK_FILL_COLS.keys())
+    if unknown:
+        raise HTTPException(400, f"Недозволені поля: {', '.join(sorted(unknown))}")
+    if body.scope not in ("selected", "filtered"):
+        raise HTTPException(400, "scope має бути 'selected' або 'filtered'")
+    if body.scope == "selected" and not body.article_ids:
+        raise HTTPException(400, "Не вибрано жодного рядка")
+
+
+@router.post("/bulk-fill-preview")
+def bulk_fill_preview(body: BulkFillRequest, _u=Depends(require_admin)):
+    ensure_article_columns(); _ensure_merge_columns()
+    _validate_bulk(body)
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        if body.scope == "selected":
+            placeholders = ",".join(["%s"] * len(body.article_ids))
+            cur.execute(
+                f"SELECT COUNT(*) FROM dim_article WHERE article_id IN ({placeholders})",
+                body.article_ids,
+            )
+        else:
+            where, params = _build_bulk_where(body.filters)
+            cur.execute(f"SELECT COUNT(*) FROM dim_article WHERE {' AND '.join(where)}", params)
+        count = int(cur.fetchone()[0])
+
+        warnings = []
+        if "article_name" in body.updates:
+            warnings.append("Зміна назви статті може вплинути на звіти та прив'язки")
+        if "pnl_id" in body.updates:
+            warnings.append("Зміна PnL ID змінить рядок структури PnL для цих статей")
+
+        return {"count": count, "fields": list(body.updates.keys()), "warnings": warnings}
+    finally:
+        cur.close(); conn.close()
+
+
+@router.post("/bulk-fill")
+def bulk_fill(body: BulkFillRequest, _u=Depends(require_admin)):
+    ensure_article_columns(); _ensure_merge_columns()
+    _validate_bulk(body)
+
+    set_parts, set_params = [], []
+    for key, col in _BULK_FILL_COLS.items():
+        if key not in body.updates:
+            continue
+        val = body.updates[key]
+        if key == "pnl_id":
+            set_parts.append(f"{col} = %s")
+            set_params.append(int(val) if val not in (None, "", 0) else None)
+        else:
+            set_parts.append(f"{col} = %s")
+            set_params.append(str(val) if val is not None else "")
+
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        if body.scope == "selected":
+            placeholders = ",".join(["%s"] * len(body.article_ids))
+            where_sql, where_params = f"article_id IN ({placeholders})", list(body.article_ids)
+        else:
+            where, where_params = _build_bulk_where(body.filters)
+            where_sql = " AND ".join(where)
+
+        cur.execute(
+            f"UPDATE dim_article SET {', '.join(set_parts)} WHERE {where_sql}",
+            set_params + where_params,
+        )
+        updated = cur.rowcount
+        conn.commit()
+        return {"updated": updated}
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         cur.close(); conn.close()

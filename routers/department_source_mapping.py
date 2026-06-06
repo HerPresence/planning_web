@@ -3,9 +3,12 @@ Department source mapping — HTTP endpoints.
 Manages dim_department_source ↔ department_source_mapping ↔ dim_department correspondence.
 """
 
+import logging
 import time
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
+
+logger = logging.getLogger(__name__)
 from pydantic import BaseModel
 
 from auth.dependencies import get_current_user
@@ -69,19 +72,21 @@ class AutoBindRequest(BaseModel):
 
 
 class BulkFillFilters(BaseModel):
-    source_id:              Optional[int] = None
-    organization_name:      Optional[str] = None
-    branch_name:            Optional[str] = None
-    region_name:            Optional[str] = None
-    master_department_id:   Optional[str] = None
-    mapping_status:         Optional[str] = None
-    search:                 Optional[str] = None
-    has_parent:             Optional[str] = None
-    parent_status:          Optional[str] = None
-    parent_department_id:   Optional[str] = None
-    parent_department_name: Optional[str] = None
-    source_level:           Optional[int] = None
-    source_node_type:       Optional[str] = None
+    source_id:              Optional[int]  = None
+    organization_name:      Optional[str]  = None
+    branch_name:            Optional[str]  = None
+    region_name:            Optional[str]  = None
+    master_department_id:   Optional[str]  = None
+    mapping_status:         Optional[str]  = None
+    search:                 Optional[str]  = None
+    has_parent:             Optional[str]  = None
+    parent_status:          Optional[str]  = None
+    parent_department_id:   Optional[str]  = None
+    parent_department_name: Optional[str]  = None
+    source_level:           Optional[int]  = None
+    source_node_type:       Optional[str]  = None
+    computed_status:        Optional[str]  = None
+    source_changed:         Optional[bool] = None
 
 
 class BulkFillRequest(BaseModel):
@@ -556,6 +561,7 @@ def _has_any_filter(f: BulkFillFilters) -> bool:
         or f.search
         or f.has_parent or f.parent_status or f.parent_department_id or f.parent_department_name
         or f.source_level is not None or f.source_node_type
+        or f.computed_status or f.source_changed is not None
     )
 
 
@@ -689,6 +695,21 @@ def _build_bulk_where(f: BulkFillFilters):
             where.append(f"{_BULK_HAS_PARENT} AND NOT {_BULK_SRC_CHILDREN}")
         elif f.source_node_type == "parent_child":
             where.append(f"{_BULK_HAS_PARENT} AND {_BULK_SRC_CHILDREN}")
+
+    if f.computed_status:
+        if f.computed_status == "ready_to_create":
+            where.append(_IS_READY_SQL)
+        elif f.computed_status == "parent_missing":
+            where.append(f"{_IS_PENDING} AND {_PARENT_MISSING_SQL}")
+        elif f.computed_status == "duplicate_warning":
+            where.append(f"{_IS_PENDING} AND {_HAS_DUP_ID_SQL} AND NOT {_PARENT_MISSING_SQL}")
+        elif f.computed_status in ("mapped", "auto", "rejected"):
+            where.append("dsm.mapping_status = %s")
+            params.append(f.computed_status)
+
+    if f.source_changed is not None:
+        where.append("dds.source_changed = %s")
+        params.append(f.source_changed)
 
     return (" AND ".join(where)) if where else "TRUE", params
 
@@ -1816,6 +1837,15 @@ def bulk_fill(body: BulkFillRequest, _u=Depends(get_current_user)):
     cur = conn.cursor()
     try:
         where_sql, params = _build_bulk_where(body.filters)
+        logger.info(
+            "bulk_fill start: field=%s value=%r filters=%s where=%s",
+            body.field, body.value, body.filters.model_dump(exclude_none=True), where_sql,
+        )
+
+        # Count rows matched by filters BEFORE update
+        cur.execute(f"SELECT COUNT(*) {_BULK_JOIN} WHERE {where_sql}", params)
+        rows_matched = int(cur.fetchone()[0])
+        logger.info("bulk_fill: rows_matched=%d", rows_matched)
 
         cur.execute(
             f"SELECT DISTINCT dsm.master_department_id {_BULK_JOIN} WHERE {where_sql} AND {_IS_MAPPED}",
@@ -1895,16 +1925,37 @@ def bulk_fill(body: BulkFillRequest, _u=Depends(get_current_user)):
 
         updated_staging = cur.rowcount
         conn.commit()
+
+        logger.info(
+            "bulk_fill done: updated_masters=%d updated_staging=%d rows_matched=%d",
+            updated_masters, updated_staging, rows_matched,
+        )
+
+        total_updated = updated_masters + updated_staging
+        if total_updated == 0:
+            return {
+                "status":          "warning",
+                "message":         "Жоден рядок не було змінено за поточними фільтрами.",
+                "updated_masters": 0,
+                "updated_staging": 0,
+                "rows_matched":    rows_matched,
+                "field_label":     _FIELD_LABELS[body.field],
+                "value":           body.value,
+                "value_id":        body.value_id,
+            }
+
         return {
             "status":          "ok",
             "updated_masters": updated_masters,
             "updated_staging": updated_staging,
+            "rows_matched":    rows_matched,
             "field_label":     _FIELD_LABELS[body.field],
             "value":           body.value,
             "value_id":        body.value_id,
         }
     except Exception as exc:
         conn.rollback()
+        logger.exception("bulk_fill error: %s", exc)
         return {"status": "error", "message": str(exc)}
     finally:
         cur.close()

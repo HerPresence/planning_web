@@ -15,12 +15,14 @@ from services.planning_engine import (
     create_effect, create_rule,
     delete_effect, delete_rule,
     generate_first_draft,
+    get_brand_mapping_coverage,
     get_dept_mapping_coverage,
     get_planning_readiness,
     get_plans_overview,
+    get_readiness_problems,
     delete_version,
     get_dim_options,
-    get_fact_plan, get_fact_plan_aggregated,
+    get_fact_plan, get_fact_plan_aggregated, get_fact_plan_grouped,
     get_generation_log, get_generation_status,
     get_plan_dept_options, get_plan_pg_options,
     get_rules, get_scenario, get_scenarios,
@@ -309,6 +311,38 @@ def aggregated_plan(scenario_id: int, version_id: int, group_by: str="month", pe
         raise HTTPException(400, "group_by must be: month | department | product_group")
     return get_fact_plan_aggregated(scenario_id=scenario_id, version_id=version_id, group_by=group_by, period_from=period_from, period_to=period_to)
 
+@router.get("/fact-plan/grouped")
+def grouped_plan(
+    scenario_id: Optional[int]=None, version_id: Optional[int]=None,
+    group_by: str="region",
+    period_from: Optional[str]=None, period_to: Optional[str]=None,
+    region: Optional[str]=None, branch: Optional[str]=None,
+    holding: Optional[str]=None, organization: Optional[str]=None,
+    department_name: Optional[str]=None, department_uid: Optional[str]=None,
+    product_group_name: Optional[str]=None, product_group_uid: Optional[str]=None,
+    brand_name: Optional[str]=None,
+    _u=Depends(get_current_user),
+):
+    import traceback as _tb
+    print(f"[DEBUG] grouped_plan called: scenario={scenario_id} version={version_id} group_by={group_by!r}", flush=True)
+    _allowed = {"region", "branch", "organization", "department", "brand"}
+    dims = [g.strip() for g in group_by.split(",") if g.strip() in _allowed]
+    if not dims:
+        raise HTTPException(400, "group_by must contain at least one of: region, branch, organization, department, brand")
+    try:
+        return get_fact_plan_grouped(
+            scenario_id=scenario_id, version_id=version_id,
+            group_by=group_by,
+            period_from=period_from, period_to=period_to,
+            region=region, branch=branch, holding=holding, organization=organization,
+            department_name=department_name, department_uid=department_uid,
+            product_group_name=product_group_name, product_group_uid=product_group_uid,
+            brand_name=brand_name,
+        )
+    except Exception as _exc:
+        print(f"[DEBUG] grouped_plan EXCEPTION: {type(_exc).__name__}: {_exc}\n{_tb.format_exc()}", flush=True)
+        raise HTTPException(status_code=500, detail=f"{type(_exc).__name__}: {_exc}\n{_tb.format_exc()}")
+
 @router.get("/fact-plan/filter-options/departments")
 def plan_dept_options(scenario_id: int, version_id: int, search: str="", limit: int=50, _u=Depends(get_current_user)):
     return get_plan_dept_options(scenario_id=scenario_id, version_id=version_id, search=search, limit=limit)
@@ -385,6 +419,45 @@ def planning_readiness_endpoint(
     _u=Depends(get_current_user),
 ):
     return get_planning_readiness(period_from=period_from, period_to=period_to, source_id=source_id)
+
+
+@router.get("/readiness-problems")
+def readiness_problems_endpoint(
+    problem_type: str,
+    period_from:  Optional[str] = None,
+    period_to:    Optional[str] = None,
+    source_id:    Optional[int] = None,
+    page:         int = 1,
+    page_size:    int = 50,
+    search:       Optional[str] = None,
+    _u=Depends(get_current_user),
+):
+    try:
+        return get_readiness_problems(
+            problem_type=problem_type,
+            period_from=period_from, period_to=period_to, source_id=source_id,
+            page=page, page_size=page_size, search=search,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/brand-mapping-coverage")
+def brand_mapping_coverage_endpoint(
+    period_from: Optional[str] = None,
+    period_to:   Optional[str] = None,
+    source_id:   Optional[int] = None,
+    _u=Depends(get_current_user),
+):
+    import traceback as _tb
+    print(f"[DEBUG] brand_mapping_coverage_endpoint called: period_from={period_from!r} source_id={source_id!r}", flush=True)
+    try:
+        result = get_brand_mapping_coverage(period_from=period_from, period_to=period_to, source_id=source_id)
+        print(f"[DEBUG] brand_mapping_coverage returned OK, keys={list(result.keys()) if isinstance(result, dict) else type(result)}", flush=True)
+        return result
+    except Exception as exc:
+        print(f"[DEBUG] brand_mapping_coverage EXCEPTION: {type(exc).__name__}: {exc}\n{_tb.format_exc()}", flush=True)
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}\n{_tb.format_exc()}")
 
 
 @router.get("/plans-overview")

@@ -1,5 +1,7 @@
 import uuid
 from fastapi import APIRouter, Depends, Form, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any, List
 from auth.dependencies import get_current_user
 from db import get_connection
 from services.rls_service import build_scope_filter
@@ -50,18 +52,26 @@ def get_departments(user=Depends(get_current_user)):
 
     scope_sql, scope_params = ("", [])
     if not user["is_admin"]:
-        scope_sql, scope_params = build_scope_filter(user["id"])
+        scope_sql, scope_params = build_scope_filter(user["id"], table_prefix="d.")
 
-    base_where = "COALESCE(is_deleted, FALSE) = FALSE"
+    base_where = "COALESCE(d.is_deleted, FALSE) = FALSE"
     where = f"WHERE {base_where}" + (f" AND {scope_sql}" if scope_sql else "")
     cur.execute(
         f"""
         SELECT d.department_id, d.holding_name, d.organization_name, d.region_name, d.branch_name,
                d.department_name, d.is_active, d.parent_department_id, d.parent_department_name,
-               (SELECT COUNT(*) FROM dim_department c
-                WHERE c.parent_department_id = d.department_id
-                  AND COALESCE(c.is_deleted, FALSE) = FALSE) AS child_count
+               COALESCE(cc.child_count, 0)::int AS child_count,
+               (d.parent_department_id IS NULL OR p.department_id IS NOT NULL) AS parent_exists
         FROM dim_department d
+        LEFT JOIN (
+            SELECT parent_department_id, COUNT(*)::int AS child_count
+            FROM dim_department
+            WHERE COALESCE(is_deleted, FALSE) = FALSE
+            GROUP BY parent_department_id
+        ) cc ON cc.parent_department_id = d.department_id
+        LEFT JOIN dim_department p
+               ON p.department_id = d.parent_department_id
+              AND COALESCE(p.is_deleted, FALSE) = FALSE
         {where}
         ORDER BY
             COALESCE(d.parent_department_id, d.department_id),
@@ -74,7 +84,8 @@ def get_departments(user=Depends(get_current_user)):
 
     result = []
     for r in rows:
-        child_count = int(r[9] or 0)
+        child_count   = int(r[9] or 0)
+        parent_exists = bool(r[10]) if r[10] is not None else True
         result.append(
             {
                 "department_id":          r[0],
@@ -89,6 +100,7 @@ def get_departments(user=Depends(get_current_user)):
                 "child_count":            child_count,
                 "has_children":           child_count > 0,
                 "hierarchy_level":        0 if not r[7] else 1,
+                "parent_exists":          parent_exists,
             }
         )
 
@@ -234,3 +246,132 @@ def restore_department(department_id: str):
     cur.close()
     conn.close()
     return {"status": "ok"}
+
+
+# ── Bulk fill attributes ───────────────────────────────────────────────────────
+
+_DEPT_FILL_COLS = {
+    "holding_name":      "holding_name",
+    "organization_name": "organization_name",
+    "region_name":       "region_name",
+    "branch_name":       "branch_name",
+}
+
+
+class DeptBulkFillRequest(BaseModel):
+    department_ids: List[str] = []
+    updates:        Dict[str, Any] = {}
+
+
+# ── Bulk update filtered departments ──────────────────────────────────────────
+
+_BULK_UPD_ALLOWED = {
+    "holding_name",
+    "organization_name",
+    "region_name",
+    "branch_name",
+    "parent_department_id",
+    "parent_department_name",
+    "is_active",
+}
+
+
+class DeptBulkUpdateFilteredRequest(BaseModel):
+    department_ids: List[str] = []
+    updates:        Dict[str, Any] = {}
+
+
+@router.post("/bulk-fill")
+def bulk_fill_departments(body: DeptBulkFillRequest, _u=Depends(get_current_user)):
+    if not body.updates:
+        raise HTTPException(400, "Не вибрано жодного поля для оновлення")
+    unknown = set(body.updates.keys()) - set(_DEPT_FILL_COLS.keys())
+    if unknown:
+        raise HTTPException(400, f"Недозволені поля: {', '.join(sorted(unknown))}")
+    if not body.department_ids:
+        raise HTTPException(400, "Не вибрано жодного підрозділу")
+
+    set_parts, set_params = [], []
+    for key, col in _DEPT_FILL_COLS.items():
+        if key in body.updates:
+            set_parts.append(f"{col} = %s")
+            set_params.append(str(body.updates[key]) if body.updates[key] is not None else "")
+
+    placeholders = ",".join(["%s"] * len(body.department_ids))
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        cur.execute(
+            f"UPDATE dim_department SET {', '.join(set_parts)} "
+            f"WHERE department_id IN ({placeholders})",
+            set_params + list(body.department_ids),
+        )
+        updated = cur.rowcount
+        conn.commit()
+        return {"updated": updated}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close(); conn.close()
+
+
+@router.post("/bulk-update-filtered")
+def bulk_update_filtered_departments(body: DeptBulkUpdateFilteredRequest, _u=Depends(get_current_user)):
+    if not body.updates:
+        raise HTTPException(400, "Не вибрано жодного поля для оновлення")
+    unknown = set(body.updates.keys()) - _BULK_UPD_ALLOWED
+    if unknown:
+        raise HTTPException(400, f"Недозволені поля: {', '.join(sorted(unknown))}")
+    if not body.department_ids:
+        raise HTTPException(400, "Не передано жодного підрозділу")
+
+    set_parts, set_params = [], []
+    for key in _BULK_UPD_ALLOWED:
+        if key not in body.updates:
+            continue
+        val = body.updates[key]
+        if key == "is_active":
+            set_parts.append("is_active = %s")
+            set_params.append(bool(val))
+        else:
+            set_parts.append(f"{key} = %s")
+            set_params.append(str(val) if val is not None else None)
+
+    placeholders = ",".join(["%s"] * len(body.department_ids))
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"SELECT COUNT(*) FROM dim_department"
+            f" WHERE department_id IN ({placeholders}) AND COALESCE(is_deleted, FALSE) = FALSE",
+            list(body.department_ids),
+        )
+        matched_rows = int(cur.fetchone()[0])
+
+        cur.execute(
+            f"UPDATE dim_department SET {', '.join(set_parts)}"
+            f" WHERE department_id IN ({placeholders}) AND COALESCE(is_deleted, FALSE) = FALSE",
+            set_params + list(body.department_ids),
+        )
+        updated_rows = cur.rowcount
+        conn.commit()
+
+        if updated_rows == 0:
+            return {
+                "status":       "warning",
+                "message":      "Жоден рядок не було змінено.",
+                "matched_rows": matched_rows,
+                "updated_rows": 0,
+            }
+
+        return {
+            "status":       "ok",
+            "matched_rows": matched_rows,
+            "updated_rows": updated_rows,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()

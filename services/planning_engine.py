@@ -1,3 +1,4 @@
+import re
 """
 Planning Engine — Rule-engine generation with enriched dimensions.
 
@@ -116,8 +117,20 @@ def scope_matches_row(row: dict, scope: dict) -> bool:
     return (row.get(field) or "") == scope.get("dimension_value", "")
 
 def rule_matches_row(row: dict, scopes: list) -> bool:
-    """AND logic: all scope conditions must match."""
-    return all(scope_matches_row(row, s) for s in scopes)
+    """OR within same dimension, AND between different dimensions."""
+    from collections import defaultdict
+    by_dim: dict = defaultdict(list)
+    for s in scopes:
+        dt = s.get("dimension_type", "all")
+        if dt == "all":
+            continue
+        by_dim[dt].append(s)
+    if not by_dim:
+        return True
+    return all(
+        any(scope_matches_row(row, s) for s in dim_scopes)
+        for dim_scopes in by_dim.values()
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -194,6 +207,15 @@ def ensure_planning_tables():
                 created_by    INTEGER
             )
         """)
+        for _col, _defn in [
+            ("scenario_type", "TEXT NOT NULL DEFAULT 'draft'"),
+            ("description",   "TEXT"),
+            ("is_active",     "BOOLEAN DEFAULT TRUE"),
+            ("created_at",    "TIMESTAMP DEFAULT NOW()"),
+            ("created_by",    "INTEGER"),
+        ]:
+            try: cur.execute(f"ALTER TABLE dim_scenario ADD COLUMN IF NOT EXISTS {_col} {_defn}"); conn.commit()
+            except Exception: conn.rollback()
 
         # ── scenario_version ─────────────────────────────────────────────────
         cur.execute("""
@@ -211,6 +233,18 @@ def ensure_planning_tables():
                 UNIQUE (scenario_id, version_number)
             )
         """)
+        for _col, _defn in [
+            ("version_name",   "TEXT NOT NULL DEFAULT 'v1'"),
+            ("description",    "TEXT"),
+            ("is_locked",      "BOOLEAN DEFAULT FALSE"),
+            ("locked_at",      "TIMESTAMP"),
+            ("locked_by",      "INTEGER"),
+            ("created_at",     "TIMESTAMP DEFAULT NOW()"),
+            ("created_by",     "INTEGER"),
+        ]:
+            try: cur.execute(f"ALTER TABLE scenario_version ADD COLUMN IF NOT EXISTS {_col} {_defn}"); conn.commit()
+            except Exception: conn.rollback()
+
         cur.execute("""
             DO $$ BEGIN
                 IF NOT EXISTS (SELECT 1 FROM pg_constraint
@@ -292,6 +326,8 @@ def ensure_planning_tables():
             "CREATE INDEX IF NOT EXISTS idx_fps_branch     ON fact_plan_sales (branch_name)",
             "CREATE INDEX IF NOT EXISTS idx_fps_brand_name ON fact_plan_sales (brand_name)",
             "CREATE INDEX IF NOT EXISTS idx_fps_gen_id     ON fact_plan_sales (generation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fps_org_name   ON fact_plan_sales (organization_name)",
+            "CREATE INDEX IF NOT EXISTS idx_fps_dept_name  ON fact_plan_sales (department_name)",
         ]:
             try: cur.execute(idx); conn.commit()
             except Exception: conn.rollback()
@@ -1133,9 +1169,20 @@ def generate_first_draft(
                     FROM enriched e
                     CROSS JOIN active_rules ar
                     WHERE NOT EXISTS (
-                        SELECT 1 FROM plan_rule_scope prs
-                        WHERE prs.rule_id = ar.rule_id
-                          AND NOT ({_SCOPE_MATCH_CASE})
+                        -- For each distinct dimension_type the row must match at least one scope (OR within dim)
+                        -- AND all dimension_types must be satisfied (AND between dims)
+                        SELECT 1
+                        FROM (
+                            SELECT DISTINCT dimension_type
+                            FROM plan_rule_scope
+                            WHERE rule_id = ar.rule_id AND dimension_type != 'all'
+                        ) dim_types
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM plan_rule_scope prs
+                            WHERE prs.rule_id = ar.rule_id
+                              AND prs.dimension_type = dim_types.dimension_type
+                              AND ({_SCOPE_MATCH_CASE})
+                        )
                     )
                 ),
                 best_rules AS (SELECT * FROM rule_matches WHERE rn=1),
@@ -1316,16 +1363,22 @@ def generate_first_draft(
                         target_period_rows = total_generated
 
                     # Rows matching scope dimensions (no period filter)
+                    # Group by dimension_type: OR within same dim, AND between dims
                     if not non_all_scopes:
                         matched_dimension_rows = total_generated
                     else:
-                        d_conds: list = ["generation_id=%s"]
-                        d_params: list = [generation_id]
+                        from collections import defaultdict as _dd
+                        _dim_groups: dict = _dd(list)
                         for sc in non_all_scopes:
                             col = _FPS_DIM_COL.get(sc.get("dimension_type", ""))
                             if col:
-                                d_conds.append(f"COALESCE({col},'') = %s")
-                                d_params.append(sc.get("dimension_value", ""))
+                                _dim_groups[col].append(sc.get("dimension_value", ""))
+                        d_conds: list = ["generation_id=%s"]
+                        d_params: list = [generation_id]
+                        for col, vals in _dim_groups.items():
+                            placeholders = ",".join(["%s"] * len(vals))
+                            d_conds.append(f"COALESCE({col},'') IN ({placeholders})")
+                            d_params.extend(vals)
                         cur.execute(f"SELECT COUNT(*) FROM fact_plan_sales WHERE {' AND '.join(d_conds)}", d_params)
                         matched_dimension_rows = int(cur.fetchone()[0])
 
@@ -1352,17 +1405,28 @@ def generate_first_draft(
                                     f"{_DIM_LABELS_UK.get(dt, dt)} пустий у {nc} рядках"
                                 )
 
+                    # Build human-readable scope description grouped by dimension (OR within, AND between)
+                    def _scope_desc(scopes_list):
+                        from collections import defaultdict as _dd2
+                        _grp: dict = _dd2(list)
+                        for s in scopes_list:
+                            label = _DIM_LABELS_UK.get(s['dimension_type'], s['dimension_type'])
+                            _grp[label].append(s['dimension_value'])
+                        parts = []
+                        for label, vals in _grp.items():
+                            if len(vals) == 1:
+                                parts.append(f"{label}={vals[0]}")
+                            else:
+                                parts.append(f"{label} IN: {', '.join(vals)}")
+                        return ", ".join(parts)
+
                     # Human-readable reason
                     if affected_rows > 0:
                         unmatched_reason = None
                     elif target_period_rows == 0:
                         unmatched_reason = "Немає рядків у вибраному periodі"
                     elif matched_dimension_rows == 0:
-                        scope_desc = ", ".join(
-                            f"{_DIM_LABELS_UK.get(s['dimension_type'], s['dimension_type'])}={s['dimension_value']}"
-                            for s in non_all_scopes
-                        )
-                        unmatched_reason = f"Не знайдено рядків для scope: {scope_desc}"
+                        unmatched_reason = f"Не знайдено рядків для scope: {_scope_desc(non_all_scopes)}"
                     elif matched_scope_count > 0:
                         unmatched_reason = "Scope знайдений, але після AND-умов рядків немає"
                     else:
@@ -1376,11 +1440,7 @@ def generate_first_draft(
                     elif matched_dimension_rows == 0 and missing_detail:
                         explanation = "Фільтр не спрацює через відсутній маппінг: " + "; ".join(missing_detail)
                     elif matched_dimension_rows == 0:
-                        sd = ", ".join(
-                            f"{_DIM_LABELS_UK.get(s['dimension_type'], s['dimension_type'])}={s['dimension_value']}"
-                            for s in non_all_scopes
-                        )
-                        explanation = f"Не знайдено жодного рядку для scope: {sd}"
+                        explanation = f"Не знайдено жодного рядку для scope: {_scope_desc(non_all_scopes)}"
                     elif matched_dimension_rows > 0 and affected_rows == 0 and (eff_period_from or eff_period_to):
                         explanation = f"Scope знайшов {matched_dimension_rows} рядків, але period видалив їх всі"
                     elif matched_scope_count > 0:
@@ -1676,6 +1736,205 @@ def get_fact_plan_aggregated(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FACT PLAN GROUPED  (server-side hierarchical aggregation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_GROUPED_DIM_COL = {
+    "region":       "region_name",
+    "branch":       "branch_name",
+    "organization": "organization_name",
+    "department":   "department_name",
+    "brand":        "brand_name",
+}
+
+_GROUPED_DIM_FALLBACK = {
+    "region":       "Без регіону",
+    "branch":       "Без філії",
+    "organization": "Без організації",
+    "department":   "Без підрозділу",
+    "brand":        "Без бренду/НГ",
+}
+
+_grouped_logger = logging.getLogger(__name__ + ".grouped")
+
+
+def get_fact_plan_grouped(
+    scenario_id=None, version_id=None,
+    group_by: str = "region",
+    period_from=None, period_to=None,
+    region=None, branch=None, holding=None, organization=None,
+    department_uid=None, department_name=None,
+    product_group_uid=None, product_group_name=None,
+    brand_name=None,
+) -> dict:
+    import time as _time
+    t0 = _time.time()
+
+    # Preserve user-supplied order; validate and deduplicate
+    seen: set = set()
+    ordered_dims: list = []
+    for g in group_by.split(","):
+        g = g.strip()
+        if g in _GROUPED_DIM_COL and g not in seen:
+            ordered_dims.append(g)
+            seen.add(g)
+
+    if not ordered_dims:
+        return {"group_by": [], "rows": [], "total": 0, "summary": {}}
+
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        conds, params = [], []
+        def _add(cond, val): conds.append(cond); params.append(val)
+        if scenario_id   is not None: _add("fps.scenario_id=%s",            scenario_id)
+        if version_id    is not None: _add("fps.version_id=%s",             version_id)
+        if period_from:               _add("fps.period_month>=%s",          period_from)
+        if period_to:                 _add("fps.period_month<=%s",          period_to)
+        if region:                    _add("fps.region_name ILIKE %s",       f"%{region}%")
+        if branch:                    _add("fps.branch_name ILIKE %s",       f"%{branch}%")
+        if holding:                   _add("fps.holding_name ILIKE %s",      f"%{holding}%")
+        if organization:              _add("fps.organization_name ILIKE %s", f"%{organization}%")
+        if department_uid and department_uid.strip():
+            _add("fps.department_uid ILIKE %s", f"%{department_uid.strip()}%")
+        if department_name and department_name.strip():
+            _add("fps.department_name ILIKE %s", f"%{department_name.strip()}%")
+        if product_group_uid and product_group_uid.strip():
+            _add("fps.product_group_uid ILIKE %s", f"%{product_group_uid.strip()}%")
+        if product_group_name and product_group_name.strip():
+            _add("fps.product_group_name ILIKE %s", f"%{product_group_name.strip()}%")
+        if brand_name and brand_name.strip():
+            _add("fps.brand_name ILIKE %s", f"%{brand_name.strip()}%")
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+
+        def _f(v): return float(v) if v is not None else 0.0
+        # Percentages are computed AFTER aggregation, not summed
+        def _dp(p, f): return round((p - f) / f * 100, 2) if f else None
+
+        all_rows: list = []
+
+        # One query per level — no N+1
+        for level_idx in range(len(ordered_dims)):
+            dims_at_level = ordered_dims[:level_idx + 1]
+            select_parts, group_parts = [], []
+            for dim in dims_at_level:
+                col = _GROUPED_DIM_COL[dim]
+                fb  = _GROUPED_DIM_FALLBACK[dim]
+                expr = f"COALESCE(fps.{col}, '{fb}')"
+                select_parts.append(f"{expr} AS grp_{dim}")
+                group_parts.append(expr)
+            for dim in ordered_dims[level_idx + 1:]:
+                select_parts.append(f"NULL AS grp_{dim}")
+
+            select_clause = ", ".join(select_parts)
+            group_clause  = ", ".join(group_parts)
+
+            cur.execute(f"""
+                SELECT {select_clause},
+                       COALESCE(SUM(fps.sales_vat_plan),  0),
+                       COALESCE(SUM(fps.fact_sales_vat),  0),
+                       COALESCE(SUM(fps.sales_kg_plan),   0),
+                       COALESCE(SUM(fps.fact_sales_kg),   0),
+                       COALESCE(SUM(fps.sales_dal_plan),  0),
+                       COALESCE(SUM(fps.fact_sales_dal),  0),
+                       COUNT(*) AS rows_count
+                FROM fact_plan_sales fps
+                {where}
+                GROUP BY {group_clause}
+                ORDER BY {group_clause}
+            """, params)
+
+            n = len(ordered_dims)
+            raw = cur.fetchall()
+            for r in raw:
+                dim_values = {ordered_dims[i]: r[i] for i in range(n)}
+                pv = _f(r[n]);     fv = _f(r[n + 1])
+                pk = _f(r[n + 2]); fk = _f(r[n + 3])
+                pd_ = _f(r[n + 4]); fd = _f(r[n + 5])
+                rows_count = int(r[n + 6])
+
+                # Stable, collision-safe keys: "dim=value|dim2=value2"
+                path_parts  = [f"{d}={dim_values[d] or ''}" for d in dims_at_level]
+                group_key   = "|".join(path_parts)
+                group_label = dim_values[dims_at_level[-1]] or ""
+                parent_key  = "|".join(path_parts[:-1]) if level_idx > 0 else None
+
+                all_rows.append({
+                    "level":       level_idx,
+                    "dim":         dims_at_level[-1],
+                    "group_key":   group_key,
+                    "group_label": group_label,
+                    "parent_key":  parent_key,
+                    "rows_count":  rows_count,
+                    **{f"grp_{d}": dim_values[d] for d in ordered_dims},
+                    "plan_revenue":      pv,   "fact_revenue":      fv,
+                    "delta_revenue":     round(pv - fv, 4),
+                    "delta_revenue_pct": _dp(pv, fv),
+                    "plan_kg":           pk,   "fact_kg":           fk,
+                    "delta_kg":          round(pk - fk, 4),
+                    "delta_kg_pct":      _dp(pk, fk),
+                    "plan_dal":          pd_,  "fact_dal":          fd,
+                    "delta_dal":         round(pd_ - fd, 4),
+                    "delta_dal_pct":     _dp(pd_, fd),
+                })
+
+        # Sort hierarchically: parent followed immediately by its children
+        by_parent: dict = {}
+        for row in all_rows:
+            if row["parent_key"] is not None:
+                by_parent.setdefault(row["parent_key"], []).append(row)
+
+        sorted_rows: list = []
+        def _append(row):
+            sorted_rows.append(row)
+            for child in sorted(by_parent.get(row["group_key"], []), key=lambda x: x["group_label"] or ""):
+                _append(child)
+
+        for root in sorted(
+            (r for r in all_rows if r["level"] == 0),
+            key=lambda x: x["group_label"] or ""
+        ):
+            _append(root)
+
+        # Summary from level-0 aggregates (avoids double-counting)
+        level_0 = [r for r in all_rows if r["level"] == 0]
+        tp_vat = sum(r["plan_revenue"] for r in level_0)
+        tf_vat = sum(r["fact_revenue"] for r in level_0)
+        tp_kg  = sum(r["plan_kg"]      for r in level_0)
+        tf_kg  = sum(r["fact_kg"]      for r in level_0)
+        tp_dal = sum(r["plan_dal"]     for r in level_0)
+        tf_dal = sum(r["fact_dal"]     for r in level_0)
+
+        elapsed_ms = round((_time.time() - t0) * 1000)
+        _grouped_logger.info(
+            "grouped: scenario=%s version=%s group_by=%s levels=%d rows=%d elapsed_ms=%d "
+            "filters={region=%s branch=%s org=%s dept=%s brand=%s period=%s/%s}",
+            scenario_id, version_id, ordered_dims,
+            len(ordered_dims), len(sorted_rows), elapsed_ms,
+            region, branch, organization, department_name, brand_name,
+            period_from, period_to,
+        )
+
+        return {
+            "group_by":   ordered_dims,
+            "rows":       sorted_rows,
+            "total":      len(sorted_rows),
+            "elapsed_ms": elapsed_ms,
+            "summary": {
+                "plan_revenue":      tp_vat, "fact_revenue":      tf_vat,
+                "delta_revenue":     round(tp_vat - tf_vat, 4),
+                "delta_revenue_pct": _dp(tp_vat, tf_vat),
+                "plan_kg":           tp_kg,  "fact_kg":           tf_kg,
+                "delta_kg":          round(tp_kg - tf_kg, 4),
+                "delta_kg_pct":      _dp(tp_kg, tf_kg),
+                "plan_dal":          tp_dal, "fact_dal":          tf_dal,
+                "delta_dal":         round(tp_dal - tf_dal, 4),
+                "delta_dal_pct":     _dp(tp_dal, tf_dal),
+            },
+        }
+    finally: cur.close(); conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DEPARTMENT MAPPING COVERAGE  (fact_turnover perspective)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1893,6 +2152,12 @@ def get_planning_readiness(period_from=None, period_to=None, source_id: Optional
             if org_pct < 90:
                 warnings.append(f"{round(100 - org_pct, 1)}% рядків не мають organization mapping")
 
+        _dims = [mapped_dept_pct, mapped_brand_pct, region_pct, branch_pct, org_pct, holding_pct]
+        _dim_labels = ["Dept mapping", "Brand mapping", "Регіон", "Філія", "Організація", "Холдинг"]
+        planning_ready_pct = round(sum(_dims) / len(_dims), 1)
+        ready_count   = sum(1 for d in _dims if d >= 100)
+        blockers      = [{"label": lbl, "pct": pct} for lbl, pct in zip(_dim_labels, _dims) if pct < 100]
+
         return {
             "fact_rows":                      fact_rows,
             "mapped_department_pct":          mapped_dept_pct,
@@ -1903,7 +2168,10 @@ def get_planning_readiness(period_from=None, period_to=None, source_id: Optional
             "rows_with_holding":              rows_with_holding,
             "rows_without_department_mapping": fact_rows - dept_mapped_rows,
             "rows_without_brand_mapping":      fact_rows - brand_mapped_rows,
-            "planning_ready_pct":             mapped_dept_pct,
+            "planning_ready_pct":             planning_ready_pct,
+            "ready_count":                    ready_count,
+            "total_count":                    len(_dims),
+            "blockers":                       blockers,
             "region_pct":                     region_pct,
             "branch_pct":                     branch_pct,
             "org_pct":                        org_pct,
@@ -1912,6 +2180,290 @@ def get_planning_readiness(period_from=None, period_to=None, source_id: Optional
             "unmapped_pg_uids":               total_pg_uids   - mapped_pg_uids,
             "warnings":                       warnings,
         }
+    finally:
+        cur.close(); conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# READINESS PROBLEMS  (Part 3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_readiness_problems(
+    problem_type: str,
+    period_from=None, period_to=None, source_id: Optional[int] = None,
+    page: int = 1, page_size: int = 50, search: Optional[str] = None,
+) -> dict:
+    """
+    Paginated list of fact_turnover rows grouped by source item that have a
+    specific readiness problem.
+
+    problem_type:
+      dept_mapping       - no mapping or mapping_status not in (mapped, auto)
+      brand_mapping      - no brand mapping
+      missing_region     - mapped dept has empty region_name
+      missing_branch     - mapped dept has empty branch_name
+      missing_organization - mapped dept has empty organization_name
+      missing_holding    - mapped dept has empty holding_name
+    """
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        base_conds: list = []
+        base_params: list = []
+        if period_from: base_conds.append("ft.period_month >= %s"); base_params.append(period_from)
+        if period_to:   base_conds.append("ft.period_month <= %s"); base_params.append(period_to)
+        if source_id:   base_conds.append("ft.source_id = %s");    base_params.append(source_id)
+
+        offset = (max(page, 1) - 1) * page_size
+
+        if problem_type == "dept_mapping":
+            unmapped = ("(m.master_department_id IS NULL"
+                        " OR m.mapping_status NOT IN ('mapped','auto')"
+                        " OR m.mapping_status IS NULL)")
+            all_conds = base_conds + [unmapped]
+            where = ("WHERE " + " AND ".join(all_conds)) if all_conds else ""
+            inner = f"""
+                SELECT
+                    ft.department_uid                  AS source_item_id,
+                    MAX(ft.department_name)            AS source_item_name,
+                    NULL::text                         AS master_id,
+                    NULL::text                         AS master_name,
+                    NULL::text                         AS holding_name,
+                    NULL::text                         AS organization_name,
+                    NULL::text                         AS branch_name,
+                    NULL::text                         AS region_name,
+                    COUNT(*)                           AS fact_rows,
+                    COALESCE(SUM(ft.sales_vat), 0)    AS sales_amount,
+                    ft.source_id                       AS source_id
+                FROM fact_turnover ft
+                LEFT JOIN department_source_mapping m
+                       ON m.source_department_id = ft.department_uid
+                      AND m.source_id            = ft.source_id
+                {where}
+                GROUP BY ft.department_uid, ft.source_id"""
+
+        elif problem_type == "brand_mapping":
+            all_conds = base_conds + ["bm.master_brand_id IS NULL"]
+            where = ("WHERE " + " AND ".join(all_conds)) if all_conds else ""
+            inner = f"""
+                SELECT
+                    ft.product_group_uid               AS source_item_id,
+                    MAX(ft.product_group_name)         AS source_item_name,
+                    NULL::text                         AS master_id,
+                    NULL::text                         AS master_name,
+                    NULL::text                         AS holding_name,
+                    NULL::text                         AS organization_name,
+                    NULL::text                         AS branch_name,
+                    NULL::text                         AS region_name,
+                    COUNT(*)                           AS fact_rows,
+                    COALESCE(SUM(ft.sales_vat), 0)    AS sales_amount,
+                    ft.source_id                       AS source_id
+                FROM fact_turnover ft
+                LEFT JOIN brand_source_mapping bm
+                       ON bm.source_brand_id = ft.product_group_uid
+                      AND bm.source_id       = ft.source_id
+                {where}
+                GROUP BY ft.product_group_uid, ft.source_id"""
+
+        else:
+            attr_cond = {
+                "missing_region":       "COALESCE(dd.region_name, '') = ''",
+                "missing_branch":       "COALESCE(dd.branch_name, '') = ''",
+                "missing_organization": "COALESCE(dd.organization_name, '') = ''",
+                "missing_holding":      "COALESCE(dd.holding_name, '') = ''",
+            }.get(problem_type)
+            if not attr_cond:
+                raise ValueError(f"Unknown problem_type: {problem_type!r}")
+            mapped = "m.master_department_id IS NOT NULL AND m.mapping_status IN ('mapped','auto')"
+            all_conds = base_conds + [mapped, attr_cond]
+            where = "WHERE " + " AND ".join(all_conds)
+            inner = f"""
+                SELECT
+                    ft.department_uid                      AS source_item_id,
+                    MAX(ft.department_name)                AS source_item_name,
+                    m.master_department_id                 AS master_id,
+                    MAX(dd.department_name)                AS master_name,
+                    MAX(dd.holding_name)                   AS holding_name,
+                    MAX(dd.organization_name)              AS organization_name,
+                    MAX(dd.branch_name)                    AS branch_name,
+                    MAX(dd.region_name)                    AS region_name,
+                    COUNT(*)                               AS fact_rows,
+                    COALESCE(SUM(ft.sales_vat), 0)        AS sales_amount,
+                    ft.source_id                           AS source_id,
+                    MAX(dd.parent_department_id)           AS parent_department_id,
+                    MAX(dd.parent_department_name)         AS parent_department_name,
+                    BOOL_AND(COALESCE(dd.is_active, true)) AS is_active
+                FROM fact_turnover ft
+                JOIN department_source_mapping m
+                    ON m.source_department_id = ft.department_uid
+                   AND m.source_id            = ft.source_id
+                JOIN dim_department dd ON dd.department_id = m.master_department_id
+                {where}
+                GROUP BY ft.department_uid, m.master_department_id, ft.source_id"""
+
+        # Optional search on the aggregated result
+        search_sql, search_params = "", []
+        if search:
+            p = f"%{search}%"
+            search_sql = ("WHERE COALESCE(source_item_id,'') ILIKE %s"
+                          "   OR COALESCE(source_item_name,'') ILIKE %s"
+                          "   OR COALESCE(master_name,'') ILIKE %s")
+            search_params = [p, p, p]
+
+        all_p = base_params + search_params
+
+        # Total count
+        cur.execute(f"SELECT COUNT(*) FROM ({inner}) sub {search_sql}", all_p)
+        total = int(cur.fetchone()[0])
+
+        # KPI over all matching rows
+        cur.execute(
+            f"SELECT SUM(fact_rows), SUM(sales_amount), COUNT(*)"
+            f" FROM ({inner}) sub {search_sql}",
+            all_p,
+        )
+        krow = cur.fetchone()
+        kpi = {
+            "affected_rows":  int(krow[0] or 0),
+            "affected_sales": float(krow[1] or 0),
+            "unique_items":   int(krow[2] or 0),
+        }
+
+        # Page of results
+        cur.execute(
+            f"SELECT * FROM ({inner}) sub {search_sql}"
+            f" ORDER BY sales_amount DESC NULLS LAST LIMIT %s OFFSET %s",
+            all_p + [page_size, offset],
+        )
+        rows = [
+            {
+                "source_item_id":       r[0],
+                "source_item_name":     r[1],
+                "master_id":            r[2],
+                "master_name":          r[3],
+                "holding_name":         r[4],
+                "organization_name":    r[5],
+                "branch_name":          r[6],
+                "region_name":          r[7],
+                "fact_rows":            int(r[8]),
+                "sales_amount":         float(r[9] or 0),
+                "source_id":            r[10],
+                "parent_department_id":   r[11] if len(r) > 11 else None,
+                "parent_department_name": r[12] if len(r) > 12 else None,
+                "is_active":              bool(r[13]) if len(r) > 13 and r[13] is not None else True,
+            }
+            for r in cur.fetchall()
+        ]
+
+        return {"rows": rows, "total": total, "page": page, "page_size": page_size, "kpi": kpi}
+    finally:
+        cur.close(); conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BRAND MAPPING COVERAGE  (Part 4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_brand_mapping_coverage(
+    period_from=None, period_to=None, source_id: Optional[int] = None,
+) -> dict:
+    """Coverage of brand_source_mapping vs fact_turnover (product_group_uid)."""
+    import traceback as _tb
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        conds: list = []
+        params: list = []
+        if period_from: conds.append("ft.period_month >= %s"); params.append(period_from)
+        if period_to:   conds.append("ft.period_month <= %s"); params.append(period_to)
+        if source_id:   conds.append("ft.source_id = %s");    params.append(source_id)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+
+        _MAPPED   = "bm.master_brand_id IS NOT NULL"
+        _UNMAPPED = "bm.master_brand_id IS NULL"
+
+        cur.execute(f"""
+            SELECT
+              COUNT(*)                                                        AS total_fact_rows,
+              COUNT(*) FILTER (WHERE {_MAPPED})                              AS mapped_rows,
+              COUNT(*) FILTER (WHERE {_UNMAPPED})                            AS unmapped_rows,
+              COALESCE(SUM(ft.sales_vat), 0)                                 AS total_sales_vat,
+              COALESCE(SUM(ft.sales_vat) FILTER (WHERE {_MAPPED}),   0)     AS mapped_sales_vat,
+              COALESCE(SUM(ft.sales_vat) FILTER (WHERE {_UNMAPPED}), 0)     AS unmapped_sales_vat,
+              COUNT(DISTINCT ft.product_group_uid)                           AS unique_fact_brands,
+              COUNT(DISTINCT ft.product_group_uid) FILTER (WHERE {_MAPPED}) AS mapped_brands,
+              COUNT(DISTINCT ft.product_group_uid) FILTER (WHERE {_UNMAPPED}) AS unmapped_brands
+            FROM fact_turnover ft
+            LEFT JOIN brand_source_mapping bm
+                   ON bm.source_brand_id = ft.product_group_uid
+                  AND bm.source_id       = ft.source_id
+            {where}
+        """, params)
+        agg = cur.fetchone()
+        total_fact_rows   = int(agg[0])
+        unique_fact_brands = int(agg[6])
+        mapped_brands     = int(agg[7])
+        unmapped_brands   = int(agg[8])
+        coverage_pct = round(mapped_brands / unique_fact_brands * 100, 1) if unique_fact_brands > 0 else 0.0
+
+        if coverage_pct == 100:
+            explanation = "Усі товарні групи/бренди мають mapping. Planning rules з brand фільтрами охоплюють усі рядки."
+        elif coverage_pct >= 80:
+            explanation = (f"Більшість брендів замаплено ({coverage_pct}%). "
+                           f"{unmapped_brands} без mapping — рядки fact не отримають brand-специфічних правил.")
+        else:
+            explanation = (f"Частина товарних груп/брендів не має mapping ({coverage_pct}%). "
+                           "Planning rules з brand/product group фільтрами не зможуть охопити ці рядки.")
+
+        # Unmapped brand details
+        unmapped_conds = conds + [_UNMAPPED]
+        unmapped_where = "WHERE " + " AND ".join(unmapped_conds) if unmapped_conds else ""
+        cur.execute(f"""
+            SELECT
+              ft.product_group_uid,
+              ft.source_id,
+              MAX(ft.product_group_name)     AS brand_name,
+              COUNT(*)                       AS rows_count,
+              COALESCE(SUM(ft.sales_vat), 0) AS sales_vat_sum
+            FROM fact_turnover ft
+            LEFT JOIN brand_source_mapping bm
+                   ON bm.source_brand_id = ft.product_group_uid
+                  AND bm.source_id       = ft.source_id
+            {unmapped_where}
+            GROUP BY ft.product_group_uid, ft.source_id
+            ORDER BY SUM(ft.sales_vat) DESC NULLS LAST
+            LIMIT 200
+        """, params)
+
+        VAT_HIGH, VAT_MEDIUM = 1_000_000, 100_000
+        unmapped_list = []
+        for r in cur.fetchall():
+            vat = float(r[4] or 0)
+            raw_uid = r[0] or ""
+            normalized_uid = re.sub(r"[^a-zA-Z0-9]", "", raw_uid).lower()
+            unmapped_list.append({
+                "brand_uid":      raw_uid,
+                "source_id":      r[1],
+                "brand_name":     r[2],
+                "rows_count":     int(r[3]),
+                "sales_vat_sum":  vat,
+                "impact_level":   "HIGH" if vat > VAT_HIGH else "MEDIUM" if vat > VAT_MEDIUM else "LOW",
+                "normalized_uid": normalized_uid,
+            })
+
+        def _f(v): return float(v) if v is not None else 0.0
+        return {
+            "total_fact_rows":    total_fact_rows,
+            "unique_fact_brands": unique_fact_brands,
+            "mapped_brands":      mapped_brands,
+            "unmapped_brands":    unmapped_brands,
+            "mapped_sales_vat":   _f(agg[4]),
+            "unmapped_sales_vat": _f(agg[5]),
+            "coverage_pct":       coverage_pct,
+            "explanation":        explanation,
+            "unmapped_brands_list": unmapped_list,
+        }
+    except Exception as _exc:
+        log.error("get_brand_mapping_coverage FAILED: %s\n%s", _exc, _tb.format_exc())
+        raise
     finally:
         cur.close(); conn.close()
 
